@@ -2,6 +2,8 @@
 
 Desktop tool that takes multi-camera recordings, transcribes the audio, generates AI chapter titles, and exports a colour-coded Premiere Pro XML timeline.
 
+Made by Cratior - "This tool uses AI to improve video editing by automatically segmenting projects. Cost is approximately $0.06 for a 10-minute video, varying based on video length, model choice, and other factors."
+
 ## Prerequisites
 
 - Python 3.11+
