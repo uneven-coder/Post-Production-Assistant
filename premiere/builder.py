@@ -57,8 +57,8 @@ class TimelineBuilder:
             pass
         return None
 
-    def _build_cuts(self, total_frames: int) -> list[tuple[int, int, str]]:
-        raw: list[tuple[int, int, str]] = []
+    def _build_cuts(self, total_frames: int) -> list[tuple[int, int, str, str]]:
+        raw: list[tuple[int, int, str, str]] = []
 
         print(f"\n=== Building Cuts (reference_duration={total_frames} frames @ {self.fps}fps = {total_frames/self.fps:.1f}s) ===")
         print(f"Chapters received: {len(self.chapters)}")
@@ -70,9 +70,10 @@ class TimelineBuilder:
                 s = max(0, int(float(st.get("start_time", 0)) * self.fps))
                 e = max(0, int(float(st.get("end_time", 0)) * self.fps))
                 t = st.get("type") or "other"
+                summary = st.get("summary", "") or ""
                 print(f"  Seg {si}: {st.get('start_time', 0):.1f}s-{st.get('end_time', 0):.1f}s -> frames {s}-{e} type={t}")
                 if e > s:
-                    raw.append((s, e, t))
+                    raw.append((s, e, t, summary))
                 else:
                     print(f"    SKIPPED (end <= start)")
 
@@ -83,35 +84,35 @@ class TimelineBuilder:
                 s = max(0, int(getattr(ch, "start_time", 0) * self.fps))
                 e = max(0, int(getattr(ch, "end_time", 0) * self.fps))
                 if e > s:
-                    raw.append((s, e, "other"))
+                    raw.append((s, e, "other", ""))
         if not raw:
-            return [(0, total_frames, "other")]
+            return [(0, total_frames, "other", "")]
 
         raw.sort()
-        cuts: list[tuple[int, int, str]] = []
-        for s, e, t in raw:
+        cuts: list[tuple[int, int, str, str]] = []
+        for s, e, t, summ in raw:
             sc = min(s, total_frames)
             ec = min(e, total_frames)
             if cuts and sc < cuts[-1][1]:
                 sc = cuts[-1][1]
             if ec > sc:
-                cuts.append((sc, ec, t))
+                cuts.append((sc, ec, t, summ))
 
         if not cuts:
-            return [(0, total_frames, "other")]
+            return [(0, total_frames, "other", "")]
 
         # Fill gaps
         filled = []
         if cuts[0][0] > 0:
-            filled.append((0, cuts[0][0], "other"))
+            filled.append((0, cuts[0][0], "other", ""))
         filled.append(cuts[0])
         for i in range(1, len(cuts)):
             prev_end = filled[-1][1]
             if cuts[i][0] > prev_end:
-                filled.append((prev_end, cuts[i][0], "other"))
+                filled.append((prev_end, cuts[i][0], "other", ""))
             filled.append(cuts[i])
         if filled[-1][1] < total_frames:
-            filled.append((filled[-1][1], total_frames, "other"))
+            filled.append((filled[-1][1], total_frames, "other", ""))
 
         print(f"\nFinal cuts: {len(filled)}")
         return filled
@@ -181,7 +182,7 @@ class TimelineBuilder:
         cuts = self._build_cuts(ref_dur)
 
         print(f"\nTimeline cuts ({len(cuts)} segments, {ref_dur} frames @ {self.fps}fps):")
-        for s, e, t in cuts:
+        for s, e, t, _ in cuts:
             print(f"  [{s/self.fps:.1f}s - {e/self.fps:.1f}s] ({e-s} frames) type={t}")
 
         seq = ET.SubElement(children, "sequence", id="sequence-1")
@@ -204,7 +205,7 @@ class TimelineBuilder:
                 self._cache_clip_transform(vcfg, asset_id)
                 b = border_map[asset_id]
                 b_track = ET.SubElement(vid_seq, "track")
-                for ss, se, st in cuts:
+                for ss, se, st, _ in cuts:
                     self._add_clip_segment(b_track, b["idx"], b["video_cfg"], src_dur,
                                            ss, se, st, is_border=True,
                                            border_w=b["border_w"], border_h=b["border_h"],
@@ -216,15 +217,37 @@ class TimelineBuilder:
                                            apply_color=False)
 
             track = main_track if is_main else ET.SubElement(vid_seq, "track")
-            for ss, se, st in cuts:
+            for ss, se, st, summ in cuts:
                 self._add_clip_segment(track, idx, vcfg, src_dur, ss, se, st,
                                        resolved_path=abs_path, asset_id=asset_id,
                                        display_name=self._master_clip_names.get(idx),
-                                       apply_color=is_main)
+                                       apply_color=is_main, seg_summary=summ)
 
             self._add_full_audio_clip(ET.SubElement(aud_seq, "track"), idx, vcfg,
                                       ref_dur, abs_path, asset_id,
                                       self._master_clip_names.get(idx))
+
+        # Sequence markers — these appear as yellow diamonds on Premiere's timeline ruler
+        for ch in self.chapters:
+            ch_start  = float(getattr(ch, "start_time", 0))
+            ch_title  = getattr(ch, "title", "Chapter")
+            ch_frame  = int(ch_start * self.fps)
+            seg_types = getattr(ch, "segment_types", []) or []
+            comment_lines = []
+            for seg in seg_types:
+                stype   = seg.get("type", "other")
+                summary = seg.get("summary", "")
+                st      = seg.get("start_time", ch_start)
+                en      = seg.get("end_time",   ch_start)
+                line    = f"[{stype}] {_fcp_hms(st)}–{_fcp_hms(en)}"
+                if summary:
+                    line += f": {summary}"
+                comment_lines.append(line)
+            mk = ET.SubElement(seq, "marker")
+            ET.SubElement(mk, "name").text    = ch_title
+            ET.SubElement(mk, "comment").text = "\n".join(comment_lines)
+            ET.SubElement(mk, "in").text      = str(ch_frame)
+            ET.SubElement(mk, "out").text     = "-1"
 
         os.makedirs(self.output_dir, exist_ok=True)
         out_path = os.path.join(self.output_dir, f"{self.name}.xml")
@@ -473,7 +496,8 @@ class TimelineBuilder:
                            content_w=None, content_h=None,
                            content_ox=0, content_oy=0,
                            resolved_path=None, asset_id=None,
-                           display_name=None, apply_color=False):
+                           display_name=None, apply_color=False,
+                           seg_summary=""):
         name = display_name or os.path.basename(resolved_path or "Unknown")
         ci = ET.SubElement(track, "clipitem", id=f"clipitem-{idx}-{start_f}")
         ET.SubElement(ci, "masterclipid").text = f"masterclip-{idx}"
@@ -502,7 +526,7 @@ class TimelineBuilder:
             if overlay:
                 self._apply_clip_motion(ci, overlay, vcfg, asset_id)
 
-        self._add_log_and_color(ci)
+        self._add_log_and_color(ci, seg_type=seg_type, summary=seg_summary)
 
     def _add_full_audio_clip(self, track, idx, vcfg, dur, path, asset_id, display_name):
         name = display_name or os.path.basename(path or "Unknown")
@@ -523,10 +547,13 @@ class TimelineBuilder:
         ET.SubElement(st, "trackindex").text = "1"
         self._add_log_and_color(ci)
 
-    def _add_log_and_color(self, ci):
+    def _add_log_and_color(self, ci, seg_type="", summary=""):
         li = ET.SubElement(ci, "logginginfo")
-        for tag in ("description", "scene", "shottake", "lognote", "good"):
-            ET.SubElement(li, tag)
+        ET.SubElement(li, "description").text = seg_type or ""
+        ET.SubElement(li, "scene")
+        ET.SubElement(li, "shottake")
+        ET.SubElement(li, "lognote").text = summary or ""
+        ET.SubElement(li, "good")
         col = ET.SubElement(ci, "colorinfo")
         for tag in ("lut", "lut1", "asc_sop", "asc_sat", "lut2"):
             ET.SubElement(col, tag)
