@@ -1,0 +1,8 @@
+openai
+litellm
+python-dotenv
+filetype
+numpy<=2.0
+numba
+Pillow
+opencv-python
