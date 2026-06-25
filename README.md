@@ -40,9 +40,10 @@ All settings live in `config.json`. Key fields:
 | Field | Description |
 |---|---|
 | `project.name` | Project name, used in the output folder name |
-| `output_directory` | Path template. Supports `{project_name}` and `{date}` |
+| `output_directory` | Path template. Supports `{project_name}`, `{time}`, and `{date}` |
 | `output_options.move_inputs` | Move source videos into the output folder when `true` |
 | `output_options.date_format` | `strftime` format for `{date}`, default `%Y-%m-%d` |
+| `output_options.time_format` | time format for `{time}`, default `%H%M%S` |
 | `videos[].tags` | `audio_source` marks which video to transcribe; `main` is the primary track |
 | `videos[].overlay` | Position, scale, and border settings for overlay clips |
 | `models.transcript_model` | Whisper model for transcription |
