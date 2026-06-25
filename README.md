@@ -24,10 +24,12 @@ cp .env.example .env
 python main.py          # opens the UI
 ```
 
+**important** The default config refrences videos from a non accessible folder so make sure to change this before using.
+
 From the UI:
 1. Edit `config.json` in the Config tab or use Browse to load a different file
-2. Set your video paths and tags in the Videos tab
-3. Press **Run** to execute the full pipeline
+3. Set your video paths and tags in the Videos tab
+4. Press **Run** to execute the full pipeline
 
 The pipeline runs: border processing → transcription → chapter generation → Premiere XML export → (optionally) moves input files to output folder.
 
