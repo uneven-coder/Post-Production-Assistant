@@ -2,7 +2,7 @@ openai
 litellm
 python-dotenv
 filetype
-numpy<=2.0
+numpy
 numba
 Pillow
 opencv-python
