@@ -98,7 +98,8 @@
       "transcript_model": {
         "name": "whisper-1",
         "prompts": "Describe the session and its main content.",
-        "api_key_env": "OPENAI_API_KEY"
+        "api_key_env": "OPENAI_API_KEY",
+        "speed": 1
       },
       "chapter_title_model": {
         "name": "gpt-4.1",

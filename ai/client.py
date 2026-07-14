@@ -52,10 +52,27 @@ def _audio_duration(file_path: str) -> float:
         return 0.0
 
 
-def _extract_audio(video_path: str, audio_path: str) -> None:
+def _atempo_filter(speed: float) -> str:
+    """Build an ffmpeg atempo filter chain for an arbitrary speed (atempo only accepts 0.5-2.0 per stage)."""
+    stages = []
+    remaining = speed
+    while remaining > 2.0:
+        stages.append(2.0)
+        remaining /= 2.0
+    while remaining < 0.5:
+        stages.append(0.5)
+        remaining /= 0.5
+    stages.append(remaining)
+    return ",".join(f"atempo={s}" for s in stages)
+
+
+def _extract_audio(video_path: str, audio_path: str, speed: float = 1.0) -> None:
     print("Extracting audio from video...")
     cmd = ["ffmpeg", "-y", "-loglevel", "error", "-i", video_path,
-           "-vn", "-acodec", "pcm_s16le", "-ar", "16000", "-ac", "1", audio_path]
+           "-vn", "-acodec", "pcm_s16le", "-ar", "16000", "-ac", "1"]
+    if speed != 1.0:
+        cmd += ["-filter:a", _atempo_filter(speed)]
+    cmd.append(audio_path)
     r = subprocess.run(cmd, capture_output=True, text=True)
     if r.returncode != 0:
         raise RuntimeError(f"Audio extraction failed: {r.stderr}")
@@ -111,8 +128,13 @@ def transcribe(
     api_key_env: str = "OPENAI_API_KEY",
     output_dir: str = "./output/",
     max_workers: int = 4,
+    speed: float = 1.0,
 ) -> tuple[str, ResponseInfo]:
-    """Transcribe an audio or video file. Extracts audio from video; splits large files."""
+    """Transcribe an audio or video file. Extracts audio from video; splits large files.
+
+    `speed` speeds up the extracted audio before sending it to Whisper (e.g. 1.5x), which
+    reduces both duration and transcription cost proportionally.
+    """
     if not os.path.exists(file_path):
         raise FileNotFoundError(f"File not found: {file_path}")
 
@@ -126,7 +148,7 @@ def transcribe(
         if kind and kind.mime.startswith("video/"):
             base = os.path.splitext(os.path.basename(file_path))[0]
             audio_path = os.path.join(output_dir, f"{base}_extracted_audio.wav")
-            _extract_audio(file_path, audio_path)
+            _extract_audio(file_path, audio_path, speed=speed)
             tmp_files.append(audio_path)
 
             size_mb = os.path.getsize(audio_path) / (1024 * 1024)

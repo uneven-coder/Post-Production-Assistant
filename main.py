@@ -51,6 +51,7 @@ def process_transcript(config: dict) -> list:
         api_key_env=t_cfg.get("api_key_env", "OPENAI_API_KEY"),
         output_dir=config["project"]["output_directory"]["file"],
         max_workers=config.get("project", {}).get("performance", {}).get("max_workers", 4),
+        speed=t_cfg.get("speed", 1.0),
     )
 
     if not transcript_text or transcript_text.strip().startswith("[Error"):

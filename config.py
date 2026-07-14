@@ -66,7 +66,6 @@ def resolve_paths(config: dict) -> dict:
     time_fmt = opts.get("time_format", "%H%M%S")
     output_expanded = _expand_template(output_raw, project_name, date_fmt, time_fmt)
     resolved_out = path_field(output_expanded)
-    os.makedirs(resolved_out["file"], exist_ok=True)
     project["output_directory"] = resolved_out
 
     config["env"] = dict(os.environ)
