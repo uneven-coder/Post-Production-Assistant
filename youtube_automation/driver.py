@@ -330,12 +330,20 @@ _APPLY_CUTS_JS = """
 """
 
 
-_APPLY_CUTS_ASYNC_JS = """
-(async ([cuts, delayMs, total]) => {
+# Used only by the auto-apply (finish_editing_existing_video) path, which can see
+# hundreds of cuts from a long stream. Studio's own Trim & cut panel re-renders the
+# timeline canvas and the cut-row list after every single insertion, and that (not our
+# own per-cut JS calls) is what dominates the time and makes the tab look laggy for a
+# big batch. So the timeline/cut-list are hidden (display:none) and a "paused" message
+# shown in their place for the one plain, synchronous loop that inserts every cut,
+# restoring both once done - no async/await, no chunking, all cuts in a single call.
+_APPLY_ALL_CUTS_JS = """
+(cuts) => {
   const el = document.querySelector('ytve-trim-options-panel');
   if (!el) return {panelMissing: true};
   const label = document.getElementById('__pae_progress_label');
   const fill = document.getElementById('__pae_progress_fill');
+  const total = cuts.length;
 
   const hidden = [document.getElementById('timeline-section'),
                   document.getElementById('panel-container')].filter(Boolean);
@@ -362,16 +370,12 @@ _APPLY_CUTS_ASYNC_JS = """
       const pct = Math.round(done * 100 / total);
       if (label) label.textContent = 'PAE: UI paused - applying cuts... ' + done + '/' + total + ' (' + pct + '%)';
       if (fill) fill.style.width = pct + '%';
-
-      if (delayMs > 0) {
-        await new Promise((resolve) => setTimeout(resolve, delayMs));
-      }
     }
   } finally {
     hidden.forEach((t, i) => { t.style.display = prevDisplay[i]; });
   }
   return {results};
-})
+}
 """
 
 
@@ -857,15 +861,14 @@ def download_studio_video(
     return dest_path, pw, context, page
 
 
-def _apply_cuts_with_progress(page, cuts: list, duration: float, report: Callable,
-                              ui_delay_ms: int = 5) -> str:
-    # Applies every cut in one call to _APPLY_CUTS_ASYNC_JS, which hides the timeline
-    # and cut-row list for the duration (that's what actually causes the lag, not our
-    # own per-cut calls - see the JS constant's comment) and shows a "paused" message
-    # on the progress bar in their place, restoring both once done. Console-side
-    # progress is necessarily coarser than before (start and final result only) since
-    # the whole batch is now one blocking call rather than several chunked ones; the
-    # on-page bar still updates live, per cut, from inside that call.
+def _apply_cuts_with_progress(page, cuts: list, duration: float, report: Callable) -> str:
+    # Applies every cut in one plain, synchronous call to _APPLY_ALL_CUTS_JS, which
+    # hides the timeline/cut-list for the duration (that's what actually causes the lag,
+    # not our own per-cut calls - see the JS constant's comment) and shows a "paused"
+    # message on the progress bar in their place, restoring both once done. No
+    # async/await and no chunking on either side - console-side progress is necessarily
+    # coarser than a chunked approach (start and final result only), but the on-page bar
+    # still updates live, per cut, from inside that one call.
     if not cuts:
         msg = "No silence cuts to apply - silent_intervals is empty for this session."
         report("cuts", msg)
@@ -878,7 +881,7 @@ def _apply_cuts_with_progress(page, cuts: list, duration: float, report: Callabl
     report("cuts", f"Applying {total} cut(s) - UI paused for the duration...")
     _update_progress_bar(page, f"PAE: UI paused - applying {total} cut(s)...", pct=0)
     try:
-        outcome = page.evaluate(_APPLY_CUTS_ASYNC_JS, [ms_pairs, ui_delay_ms, total])
+        outcome = page.evaluate(_APPLY_ALL_CUTS_JS, ms_pairs)
     except Exception as ex:
         msg = f"Failed to apply cuts - {ex}"
         report("cuts", msg)
