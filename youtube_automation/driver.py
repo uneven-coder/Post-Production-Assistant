@@ -331,16 +331,27 @@ _APPLY_CUTS_JS = """
 
 
 # Used only by the auto-apply (finish_editing_existing_video) path, which can see
-# hundreds of cuts from a long stream. Studio's own Trim & cut panel re-renders the
-# timeline canvas and the cut-row list after every single insertion, and that (not our
-# own per-cut JS calls) is what dominates the time and makes the tab look laggy for a
-# big batch. So the timeline/cut-list are hidden (display:none) and a "paused" message
-# shown in their place for the one plain, synchronous loop that inserts every cut,
-# restoring both once done - no async/await, no chunking, all cuts in a single call.
+# hundreds of cuts from a long stream.
+#
+# el.cuts is a Polymer *computed* property, not the real source of truth - directly
+# overwriting it (el.set('cuts', [...])) renders correct-looking rows instantly but
+# never creates timeline markers and almost certainly wouldn't survive a real Save;
+# confirmed by intercepting el.dispatch/push/splice while performing real cuts through
+# the public API. The actual store action is EDITOR_ADD_NEW_CUT, and its payload's
+# markersMs is not "this cut's boundaries" - it's the FLAT list of every boundary
+# across the whole timeline in order: [0, cut1Start, cut1End, cut2Start, cut2End, ...,
+# newCutStart, newCutEnd, videoDurationMs]. Passing the complete list for every cut at
+# once (not just the new one) makes a single dispatch create the entire cut list
+# correctly, real markers included (verified: markerCount went from 2 to 602 for 300
+# cuts, exactly 2 per cut, matching what the slow one-by-one API produces). One
+# approveCutById() call on the last cut's id afterwards is what flips whatever flag
+# enables Save - confirmed via the same interception that neither dispatch() nor a
+# second, unobserved side effect of approveCutById() themselves account for it.
 _APPLY_ALL_CUTS_JS = """
 (cuts) => {
   const el = document.querySelector('ytve-trim-options-panel');
   if (!el) return {panelMissing: true};
+  if (cuts.length === 0) return {results: []};
   const label = document.getElementById('__pae_progress_label');
   const fill = document.getElementById('__pae_progress_fill');
   const total = cuts.length;
@@ -351,32 +362,126 @@ _APPLY_ALL_CUTS_JS = """
   for (const t of hidden) t.style.display = 'none';
   if (label) label.textContent = 'PAE: UI paused - applying ' + total + ' cut(s)...';
 
-  const results = [];
+  let results;
   try {
-    for (let i = 0; i < cuts.length; i++) {
-      const [startMs, endMs] = cuts[i];
-      try {
-        el.addNewCutAtTime(startMs);
-        const idx = el.cuts.length - 1;
-        const cutId = el.cuts[idx].id;
-        el.set('cuts.' + idx + '.endMs', endMs);
-        el.approveCutById(cutId);
-        results.push({ok: true});
-      } catch (e) {
-        results.push({ok: false, error: String(e)});
-      }
-
-      const done = i + 1;
-      const pct = Math.round(done * 100 / total);
-      if (label) label.textContent = 'PAE: UI paused - applying cuts... ' + done + '/' + total + ' (' + pct + '%)';
-      if (fill) fill.style.width = pct + '%';
+    try {
+      const videoDur = el.videoDurationMs;
+      const markersMs = [0];
+      for (const [startMs, endMs] of cuts) { markersMs.push(startMs, endMs); }
+      markersMs.push(videoDur);
+      el.dispatch({type: 'EDITOR_ADD_NEW_CUT', payload: {markersMs, cutId: total}});
+      el.approveCutById(total);
+      results = cuts.map(() => ({ok: true}));
+    } catch (e) {
+      results = cuts.map(() => ({ok: false, error: String(e)}));
     }
+
+    if (label) label.textContent = 'PAE: ' + total + ' cut(s) applied';
+    if (fill) fill.style.width = '100%';
   } finally {
     hidden.forEach((t, i) => { t.style.display = prevDisplay[i]; });
+    // Un-hiding alone doesn't reliably make Studio's own timeline/canvas repaint
+    // against the new cut list - nudge it with a resize event plus a forced reflow.
+    window.dispatchEvent(new Event('resize'));
+    void document.body.offsetHeight;
   }
   return {results};
 }
 """
+
+
+def _inject_cut_range_filter(page, total: int) -> None:
+    # Reviewing a few hundred cut-rows by scrolling is impractical, and toggling which
+    # rows are shown/hidden is also a cheap, direct way to force Studio's own
+    # timeline/canvas to recompute against the current DOM instead of relying on
+    # display:none/'' alone to trigger a proper repaint. Purely visual - only
+    # `.cut-row` elements get hidden, `el.cuts` (what Save actually reads) is untouched.
+    js = """
+([total]) => {
+  const existing = document.getElementById('__pae_range_filter');
+  if (existing) existing.remove();
+
+  const wrap = document.createElement('div');
+  wrap.id = '__pae_range_filter';
+  wrap.style.cssText = 'position:fixed;bottom:16px;left:16px;z-index:2147483647;' +
+    'background:#111;color:#ddd;padding:8px 12px;border-radius:6px;' +
+    'font-family:Roboto,Arial,sans-serif;font-size:12px;' +
+    'display:flex;align-items:center;gap:6px;box-shadow:0 2px 8px rgba(0,0,0,.35);';
+
+  const label = document.createElement('span');
+  label.textContent = 'Show cuts:';
+  label.style.cssText = 'color:#aaa;';
+
+  const inputCss = 'width:56px;padding:2px 4px;background:#222;color:#fff;' +
+    'border:1px solid #444;border-radius:3px;';
+
+  const fromInput = document.createElement('input');
+  fromInput.type = 'number';
+  fromInput.min = '1';
+  fromInput.max = String(total);
+  fromInput.value = '1';
+  fromInput.style.cssText = inputCss;
+
+  const dash = document.createElement('span');
+  dash.textContent = '-';
+  dash.style.cssText = 'color:#aaa;';
+
+  const toInput = document.createElement('input');
+  toInput.type = 'number';
+  toInput.min = '1';
+  toInput.max = String(total);
+  toInput.value = String(Math.min(total, 30));
+  toInput.style.cssText = inputCss;
+
+  const status = document.createElement('span');
+  status.style.cssText = 'color:#8f8;margin-left:4px;';
+
+  function applyRange() {
+    const rows = document.querySelectorAll('.cut-row');
+    let from = Math.max(1, parseInt(fromInput.value, 10) || 1);
+    let to = Math.min(rows.length, parseInt(toInput.value, 10) || rows.length);
+    if (to < from) to = from;
+    rows.forEach((row, i) => {
+      const n = i + 1;
+      row.style.display = (n >= from && n <= to) ? '' : 'none';
+    });
+    status.textContent = 'showing ' + from + '-' + to + ' of ' + rows.length;
+    window.dispatchEvent(new Event('resize'));
+    void document.body.offsetHeight;
+  }
+
+  const applyBtn = document.createElement('button');
+  applyBtn.textContent = 'Apply';
+  applyBtn.style.cssText = 'padding:3px 10px;background:#0e639c;color:#fff;border:none;' +
+    'border-radius:4px;cursor:pointer;font-size:11px;';
+  applyBtn.onclick = applyRange;
+
+  const allBtn = document.createElement('button');
+  allBtn.textContent = 'Show all';
+  allBtn.style.cssText = 'padding:3px 10px;background:#3c3c3c;color:#ddd;border:none;' +
+    'border-radius:4px;cursor:pointer;font-size:11px;';
+  allBtn.onclick = () => {
+    fromInput.value = '1';
+    toInput.value = String(total);
+    applyRange();
+  };
+
+  wrap.appendChild(label);
+  wrap.appendChild(fromInput);
+  wrap.appendChild(dash);
+  wrap.appendChild(toInput);
+  wrap.appendChild(applyBtn);
+  wrap.appendChild(allBtn);
+  wrap.appendChild(status);
+  document.body.appendChild(wrap);
+
+  applyRange();
+}
+"""
+    try:
+        page.evaluate(js, [total])
+    except Exception:
+        pass
 
 
 def _safe_reinject(page, init_js: str) -> None:
@@ -775,41 +880,67 @@ _MENU_BUTTON_SELECTOR = (
 )
 
 
-def _trigger_native_download(page, report: Callable):
+_DOWNLOAD_ATTEMPTS = 3
+_DOWNLOAD_START_TIMEOUT_MS = 120000  # per attempt - see retry comment below
+
+
+def _trigger_native_download(page, edit_url: str, report: Callable):
     # Opens the video's "more actions" (⋮) menu and clicks its Download item -
     # studio.youtube.com renders that item as
     # <tp-yt-paper-item test-id="VIDEO_DOWNLOAD"><a href="...download_my_video?...">.
     #
     # Must be a real click wrapped in page.expect_download(), not a GET on the href
-    # via a separate requests session with copied cookies
-    report("download", "Opening the video's options menu...")
-    menu_button = page.locator(_MENU_BUTTON_SELECTOR).first
-    try:
-        menu_button.wait_for(state="visible", timeout=20000)
-        menu_button.click(timeout=15000)
-    except Exception as e:
-        raise AutomationError(
-            "Couldn't find the video's options (...) menu button - YouTube Studio's layout "
-            "may have changed. Download the video manually and place it in the download "
-            f"directory, or check youtube_automation/driver.py's _MENU_BUTTON_SELECTOR. ({e})")
+    # via a separate requests session with copied cookies.
+    #
+    # Intermittently, the click doesn't trigger a download at all - instead the tab
+    # navigates to Studio's generic channel content list
+    # (.../channel/<id>/videos/upload?filter=...&sort=...), observed but not fully
+    # root-caused. Plausibly the href's token is time-limited and occasionally goes
+    # stale between page load and click, or the click races with Studio's own SPA
+    # click handling on the menu item. Either way a fresh page load gets a fresh
+    # token/menu state, so on that specific failure mode this reloads and retries
+    # from scratch rather than giving up after one attempt.
+    for attempt in range(1, _DOWNLOAD_ATTEMPTS + 1):
+        if attempt > 1:
+            report("download", f"Retrying download (attempt {attempt}/{_DOWNLOAD_ATTEMPTS})...")
+            page.goto(edit_url, wait_until="load")
 
-    item = page.locator('[test-id="VIDEO_DOWNLOAD"] a').first
-    try:
-        item.wait_for(state="visible", timeout=15000)
-    except Exception:
-        raise AutomationError(
-            "Couldn't find the Download option in the video's options menu - YouTube "
-            "Studio's layout may have changed. Download the video manually and place it "
-            "in the download directory, or check youtube_automation/driver.py's "
-            "_trigger_native_download() selectors.")
+        report("download", "Opening the video's options menu...")
+        menu_button = page.locator(_MENU_BUTTON_SELECTOR).first
+        try:
+            menu_button.wait_for(state="visible", timeout=20000)
+            menu_button.click(timeout=15000)
+        except Exception as e:
+            raise AutomationError(
+                "Couldn't find the video's options (...) menu button - YouTube Studio's layout "
+                "may have changed. Download the video manually and place it in the download "
+                f"directory, or check youtube_automation/driver.py's _MENU_BUTTON_SELECTOR. ({e})")
 
-    report("download", "Starting download...")
-    try:
-        with page.expect_download(timeout=600000) as download_info:
-            item.click(timeout=10000)
-    except Exception as e:
-        raise AutomationError(f"Clicking Download didn't produce a browser download: {e}")
-    return download_info.value
+        item = page.locator('[test-id="VIDEO_DOWNLOAD"] a').first
+        try:
+            item.wait_for(state="visible", timeout=15000)
+        except Exception:
+            raise AutomationError(
+                "Couldn't find the Download option in the video's options menu - YouTube "
+                "Studio's layout may have changed. Download the video manually and place it "
+                "in the download directory, or check youtube_automation/driver.py's "
+                "_trigger_native_download() selectors.")
+
+        report("download", "Starting download...")
+        try:
+            with page.expect_download(timeout=_DOWNLOAD_START_TIMEOUT_MS) as download_info:
+                item.click(timeout=10000)
+            return download_info.value
+        except Exception as e:
+            wrong_page = "/video/" not in page.url
+            if wrong_page:
+                report("download", f"Click navigated to {page.url} instead of downloading "
+                                    f"(attempt {attempt}/{_DOWNLOAD_ATTEMPTS}).")
+            last_error = e
+
+    raise AutomationError(
+        f"Clicking Download didn't produce a browser download after "
+        f"{_DOWNLOAD_ATTEMPTS} attempts: {last_error}")
 
 
 _HTML_SIGNATURES = (b"<!doctype", b"<html")
@@ -838,7 +969,7 @@ def download_studio_video(
     _inject_progress_bar(page)
     _update_progress_bar(page, "PAE: locating download link...", pct=0)
 
-    download = _trigger_native_download(page, report)
+    download = _trigger_native_download(page, edit_url, report)
 
     dest_path = os.path.join(dest_dir, f"{video_id}.mp4")
     report("download", "Downloading (can take a while for large videos)...")
@@ -862,13 +993,10 @@ def download_studio_video(
 
 
 def _apply_cuts_with_progress(page, cuts: list, duration: float, report: Callable) -> str:
-    # Applies every cut in one plain, synchronous call to _APPLY_ALL_CUTS_JS, which
-    # hides the timeline/cut-list for the duration (that's what actually causes the lag,
-    # not our own per-cut calls - see the JS constant's comment) and shows a "paused"
-    # message on the progress bar in their place, restoring both once done. No
-    # async/await and no chunking on either side - console-side progress is necessarily
-    # coarser than a chunked approach (start and final result only), but the on-page bar
-    # still updates live, per cut, from inside that one call.
+    # Applies every cut in one call to _APPLY_ALL_CUTS_JS - see that constant's comment
+    # for the single dispatch() + approveCutById() recipe that creates real timeline
+    # markers for every cut (not just a fake-looking row list). ~2-4s for 300 cuts, so
+    # there's no meaningful "in progress" window left to show incremental progress for.
     if not cuts:
         msg = "No silence cuts to apply - silent_intervals is empty for this session."
         report("cuts", msg)
@@ -934,6 +1062,8 @@ def finish_editing_existing_video(
             f"changed. Open Editor > Trim & cut yourself and apply the cuts manually. ({e})")
 
     result = _apply_cuts_with_progress(page, cuts, duration, report)
+    if cuts:
+        _inject_cut_range_filter(page, len(cuts))
     _notify_done()
     report("done", result)
 
