@@ -6,3 +6,8 @@ numpy
 numba
 Pillow
 opencv-python
+setuptools<81
+unsilence
+python-vlc
+playwright
+pyautogui

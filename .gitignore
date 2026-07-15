@@ -183,3 +183,4 @@ pyrightconfig.json
 /.vscode/
 /videos
 /output
+.hidden-items.json

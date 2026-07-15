@@ -133,8 +133,54 @@
       "irrelevant": "red",
       "setup": "purple",
       "review": "cyan",
+      "silence": "gray",
       "other": "gray",
       "default": "white"
+    },
+    "silence_removal": {
+      "mode": "mark",
+      "min_silence_duration_s": 0.6,
+      "threshold_db": -35,
+      "padding_s": 0.12
+    },
+    "silence_only_profile": {
+      "name": "Silence Only",
+      "videos": [
+        {
+          "path": {
+            "path": "./videos/",
+            "regex": ".*\\.(mp4|mov|mkv)$"
+          },
+          "tags": [
+            "audio_source",
+            "main"
+          ],
+          "overlay": {
+            "x": 0.0,
+            "y": 0.0,
+            "width": 1.0,
+            "height": 1.0,
+            "border": {
+              "enabled": false
+            }
+          }
+        }
+      ],
+      "silence_removal": {
+        "mode": "only",
+        "min_silence_duration_s": 0.6,
+        "threshold_db": -35,
+        "padding_s": 0.12
+      }
+    },
+    "youtube_automation": {
+      "enabled": true,
+      "auto_launch_on_silence_only": true,
+      "profile_root": "",
+      "profile_name": "Default",
+      "browser_channel": "chrome",
+      "min_cut_duration_s": 1.0,
+      "max_merge_gap_s": 0.35
     },
     "transcript_windows": {
       "target_segment_length_s": 110

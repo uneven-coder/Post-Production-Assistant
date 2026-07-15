@@ -23,7 +23,7 @@ def _fcp_hms(seconds: float) -> str:
 class TimelineBuilder:
     """Builds a Premiere Pro / FCPXML timeline from config + analysis results."""
 
-    def __init__(self, config: dict, border_images: list = None):
+    def __init__(self, config: dict, border_images: list = None, silent_intervals: list = None):
         self.config = config
         self.project = config["project"]
         self.name = self.project.get("name", "Timeline")
@@ -32,6 +32,7 @@ class TimelineBuilder:
         self.frame_width = int(self.project.get("frame_width", 1920))
         self.frame_height = int(self.project.get("frame_height", 1080))
         self.border_images = border_images or []
+        self.silent_intervals = silent_intervals or []
         self.segment_colors = self.project.get("segment_colors", {})
         self.chapters: list = []
 
@@ -117,6 +118,40 @@ class TimelineBuilder:
         print(f"\nFinal cuts: {len(filled)}")
         return filled
 
+    def _inject_silence_cuts(
+        self, cuts: list[tuple[int, int, str, str]], total_frames: int,
+    ) -> list[tuple[int, int, str, str]]:
+        # type='silence' sub-segments render as disabled (hatched) clips
+        if not self.silent_intervals:
+            return cuts
+
+        silence_frames = []
+        for s, e in self.silent_intervals:
+            sf = max(0, min(int(round(s * self.fps)), total_frames))
+            ef = max(0, min(int(round(e * self.fps)), total_frames))
+            if ef > sf:
+                silence_frames.append((sf, ef))
+        if not silence_frames:
+            return cuts
+
+        result: list[tuple[int, int, str, str]] = []
+        for cs, ce, ctype, csumm in cuts:
+            overlaps = sorted((sf, ef) for sf, ef in silence_frames if ef > cs and sf < ce)
+            if not overlaps:
+                result.append((cs, ce, ctype, csumm))
+                continue
+            cursor = cs
+            for sf, ef in overlaps:
+                sf, ef = max(sf, cs), min(ef, ce)
+                if sf > cursor:
+                    result.append((cursor, sf, ctype, csumm))
+                if ef > cursor:
+                    result.append((max(sf, cursor), ef, "silence", ""))
+                cursor = max(cursor, ef)
+            if cursor < ce:
+                result.append((cursor, ce, ctype, csumm))
+        return result
+
     def build_and_export(self) -> str:
         xmeml = ET.Element("xmeml", version="4")
         proj_el = ET.SubElement(xmeml, "project")
@@ -180,6 +215,7 @@ class TimelineBuilder:
         ref_dur = main_duration or (min(durations) if durations else self.fps * 10)
         print(f"\nReference duration: {ref_dur} frames ({ref_dur/self.fps:.1f}s)")
         cuts = self._build_cuts(ref_dur)
+        cuts = self._inject_silence_cuts(cuts, ref_dur)
 
         print(f"\nTimeline cuts ({len(cuts)} segments, {ref_dur} frames @ {self.fps}fps):")
         for s, e, t, _ in cuts:
@@ -223,9 +259,8 @@ class TimelineBuilder:
                                        display_name=self._master_clip_names.get(idx),
                                        apply_color=is_main, seg_summary=summ)
 
-            self._add_full_audio_clip(ET.SubElement(aud_seq, "track"), idx, vcfg,
-                                      ref_dur, abs_path, asset_id,
-                                      self._master_clip_names.get(idx))
+            self._add_audio_clip_segments(ET.SubElement(aud_seq, "track"), idx, src_dur, cuts,
+                                          abs_path, asset_id, self._master_clip_names.get(idx))
 
         # Sequence markers — these appear as yellow diamonds on Premiere's timeline ruler
         for ch in self.chapters:
@@ -502,7 +537,7 @@ class TimelineBuilder:
         ci = ET.SubElement(track, "clipitem", id=f"clipitem-{idx}-{start_f}")
         ET.SubElement(ci, "masterclipid").text = f"masterclip-{idx}"
         ET.SubElement(ci, "name").text = name
-        ET.SubElement(ci, "enabled").text = "TRUE"
+        ET.SubElement(ci, "enabled").text = "FALSE" if seg_type == "silence" else "TRUE"
         ET.SubElement(ci, "duration").text = str(int(src_dur))
         self._add_rate(ci)
         ET.SubElement(ci, "start").text = str(int(start_f))
@@ -514,7 +549,10 @@ class TimelineBuilder:
         ET.SubElement(ci, "pixelaspectratio").text = "square"
         ET.SubElement(ci, "anamorphic").text = "FALSE"
 
-        if apply_color and seg_type:
+        if seg_type == "silence":
+            color = self.segment_colors.get("silence", "gray")
+            ET.SubElement(ET.SubElement(ci, "labels"), "label2").text = self._premiere_color(color)
+        elif apply_color and seg_type:
             color = self.segment_colors.get(seg_type, self.segment_colors.get("default", "white"))
             ET.SubElement(ET.SubElement(ci, "labels"), "label2").text = self._premiere_color(color)
 
@@ -528,24 +566,29 @@ class TimelineBuilder:
 
         self._add_log_and_color(ci, seg_type=seg_type, summary=seg_summary)
 
-    def _add_full_audio_clip(self, track, idx, vcfg, dur, path, asset_id, display_name):
+    def _add_audio_clip_segments(self, track, idx, src_dur, cuts, path, asset_id, display_name):
+        # split audio at the same cut points as video, else they desync on delete
         name = display_name or os.path.basename(path or "Unknown")
-        ci = ET.SubElement(track, "clipitem", id=f"clipitem-audio-{idx}",
-                           premiereChannelType="mono")
-        ET.SubElement(ci, "masterclipid").text = f"masterclip-{idx}"
-        ET.SubElement(ci, "name").text = name
-        ET.SubElement(ci, "enabled").text = "TRUE"
-        ET.SubElement(ci, "duration").text = str(dur)
-        ET.SubElement(ci, "start").text = "0"
-        ET.SubElement(ci, "end").text = str(dur)
-        ET.SubElement(ci, "in").text = "0"
-        ET.SubElement(ci, "out").text = str(dur)
-        ET.SubElement(ci, "file", id=f"file-{idx}")
-        self._add_rate(ci)
-        st = ET.SubElement(ci, "sourcetrack")
-        ET.SubElement(st, "mediatype").text = "audio"
-        ET.SubElement(st, "trackindex").text = "1"
-        self._add_log_and_color(ci)
+        for ss, se, seg_type, _ in cuts:
+            ci = ET.SubElement(track, "clipitem", id=f"clipitem-audio-{idx}-{ss}",
+                               premiereChannelType="mono")
+            ET.SubElement(ci, "masterclipid").text = f"masterclip-{idx}"
+            ET.SubElement(ci, "name").text = name
+            ET.SubElement(ci, "enabled").text = "FALSE" if seg_type == "silence" else "TRUE"
+            ET.SubElement(ci, "duration").text = str(int(src_dur))
+            self._add_rate(ci)
+            ET.SubElement(ci, "start").text = str(int(ss))
+            ET.SubElement(ci, "end").text = str(int(se))
+            ET.SubElement(ci, "in").text = str(int(ss))
+            ET.SubElement(ci, "out").text = str(int(se))
+            ET.SubElement(ci, "file", id=f"file-{idx}")
+            st = ET.SubElement(ci, "sourcetrack")
+            ET.SubElement(st, "mediatype").text = "audio"
+            ET.SubElement(st, "trackindex").text = "1"
+            if seg_type == "silence":
+                color = self.segment_colors.get("silence", "gray")
+                ET.SubElement(ET.SubElement(ci, "labels"), "label2").text = self._premiere_color(color)
+            self._add_log_and_color(ci, seg_type=seg_type)
 
     def _add_log_and_color(self, ci, seg_type="", summary=""):
         li = ET.SubElement(ci, "logginginfo")
@@ -635,8 +678,9 @@ class TimelineBuilder:
         return mapping.get(str(label).strip().lower(), str(label).strip().title()) if label else "Caribbean"
 
 
-def build_timeline(config: dict, border_images: list = None, chapters: list = None) -> str:
-    builder = TimelineBuilder(config, border_images)
+def build_timeline(config: dict, border_images: list = None, chapters: list = None,
+                    silent_intervals: list = None) -> str:
+    builder = TimelineBuilder(config, border_images, silent_intervals)
     if chapters:
         builder.set_chapters(chapters)
     return builder.build_and_export()

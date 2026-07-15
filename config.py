@@ -1,3 +1,4 @@
+import copy
 import os
 import re
 import json
@@ -46,6 +47,15 @@ def path_field(path: str, regex: Optional[str] = None) -> Dict[str, Any]:
         result["exists"] = os.path.exists(resolved)
 
     return result
+
+
+def apply_profile(config: dict, profile_name: str) -> dict:
+    cfg = copy.deepcopy(config)
+    project = cfg.setdefault("project", {})
+    profile = project.pop(f"{profile_name}_profile", None)
+    if profile:
+        project.update(profile)
+    return cfg
 
 
 def resolve_paths(config: dict) -> dict:

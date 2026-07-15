@@ -1,5 +1,5 @@
 """
-PAE — Post Production Assistant
+PAE - Post Production Assistant
 Tkinter UI with dynamic stage progress, config editing, video management,
 and output preview (chapters, timeline, cost).
 """
@@ -15,22 +15,32 @@ import sys
 from dataclasses import dataclass, field
 from typing import Optional, List, Any, Dict
 
-MSG_LOG         = "log"
-MSG_STAGE_START = "stage_start"
-MSG_STAGE_DONE  = "stage_done"
-MSG_STAGE_ERROR = "stage_error"
-MSG_CHAPTERS    = "chapters"
-MSG_COST        = "cost"
-MSG_DONE        = "done"
-MSG_ERROR       = "error"
+from main import (
+    ProcessingWorker,
+    MSG_LOG, MSG_STAGE_START, MSG_STAGE_DONE, MSG_STAGE_SKIP, MSG_STAGE_ERROR,
+    MSG_CHAPTERS, MSG_SILENCE, MSG_BORDERS, MSG_COST, MSG_DONE, MSG_ERROR,
+)
 
 PIPELINE_STAGES = [
+    {"id": "silence",    "label": "Detect Silence"},
     {"id": "borders",    "label": "Process Borders"},
     {"id": "transcript", "label": "Transcribe Audio"},
     {"id": "chapters",   "label": "Generate Chapters"},
     {"id": "timeline",   "label": "Build Timeline"},
     {"id": "tests",      "label": "Run Tests"},
 ]
+
+SILENCE_MODES = ["off", "mark", "only"]
+
+# app.py-only queue message kinds, separate from main.py's MSG_* protocol
+_MSG_THUMB_READY   = "_thumb_ready"
+_MSG_THUMB_ERROR   = "_thumb_error"
+_MSG_PREVIEW_READY = "_preview_ready"
+_MSG_PREVIEW_ERROR = "_preview_error"
+_MSG_PREVIEW_PROGRESS = "_preview_progress"
+_MSG_YT_PROGRESS = "_yt_progress"
+_MSG_YT_DONE = "_yt_done"
+_MSG_YT_ERROR = "_yt_error"
 
 STATUS_COLORS = {
     "pending": "#555566",
@@ -71,12 +81,19 @@ class AppState:
     stages: List[StageState] = field(default_factory=list)
     running: bool = False
     chapters: List[Any] = field(default_factory=list)
+    silent_intervals: List = field(default_factory=list)
+    border_images: List = field(default_factory=list)
+    last_resolved_config: Optional[Dict] = None
+    preview_path: Optional[str] = None
     total_cost: float = 0.0
     cost_lines: List[str] = field(default_factory=list)
     error: Optional[str] = None
 
     def reset_run(self):
         self.chapters = []
+        self.silent_intervals = []
+        self.border_images = []
+        self.preview_path = None
         self.total_cost = 0.0
         self.cost_lines = []
         self.error = None
@@ -104,75 +121,6 @@ class _QueueWriter:
     def fileno(self):
         return sys.__stdout__.fileno()
 
-class ProcessingWorker:
-    def __init__(self, q: queue.Queue, config: Dict):
-        self._q = q
-        self._config = config
-
-    def _emit(self, kind, data=None):
-        self._q.put((kind, data))
-
-    def run(self):
-        from main import (process_borders, process_transcript, process_timeline,
-                          _copy_inputs_to_output, _move_inputs)
-
-        config = self._config
-        border_images = None
-        chapters = None
-
-        _copy_inputs_to_output(config)
-
-        try:
-            self._emit(MSG_STAGE_START, "borders")
-            border_images = process_borders(config)
-            self._emit(MSG_STAGE_DONE, "borders")
-        except Exception as e:
-            self._emit(MSG_STAGE_ERROR, ("borders", str(e)))
-            self._emit(MSG_ERROR, f"Border processing failed: {e}")
-            return
-
-        try:
-            self._emit(MSG_STAGE_START, "transcript")
-            chapters = process_transcript(config)
-            self._emit(MSG_STAGE_DONE, "transcript")
-        except Exception as e:
-            self._emit(MSG_STAGE_ERROR, ("transcript", str(e)))
-            self._emit(MSG_ERROR, f"Transcript failed: {e}")
-            return
-
-        if chapters:
-            self._emit(MSG_STAGE_START, "chapters")
-            self._emit(MSG_CHAPTERS, chapters)
-            self._emit(MSG_STAGE_DONE, "chapters")
-        else:
-            self._emit(MSG_STAGE_ERROR, ("chapters", "none generated"))
-
-        try:
-            self._emit(MSG_STAGE_START, "timeline")
-            process_timeline(config, border_images, chapters)
-            self._emit(MSG_STAGE_DONE, "timeline")
-        except Exception as e:
-            self._emit(MSG_STAGE_ERROR, ("timeline", str(e)))
-            self._emit(MSG_ERROR, f"Timeline failed: {e}")
-            return
-
-        _move_inputs(config)
-
-        try:
-            self._emit(MSG_STAGE_START, "tests")
-            import unittest
-            suite = unittest.TestLoader().discover("tests")
-            result = unittest.TextTestRunner(verbosity=0, stream=open(os.devnull, "w")).run(suite)
-            if result.wasSuccessful():
-                self._emit(MSG_STAGE_DONE, "tests")
-            else:
-                fails = len(result.failures) + len(result.errors)
-                self._emit(MSG_STAGE_ERROR, ("tests", f"{fails} failure(s)"))
-        except Exception as e:
-            self._emit(MSG_STAGE_ERROR, ("tests", str(e)))
-
-        self._emit(MSG_DONE, None)
-
 def _fmt_time(seconds):
     if not seconds:
         return "0:00"
@@ -197,7 +145,7 @@ _COST_RE = re.compile(r"\$\s*([\d.]+)")
 class PAEApp(tk.Tk):
     def __init__(self):
         super().__init__()
-        self.title("PAE — Post Production Assistant")
+        self.title("PAE - Post Production Assistant")
         self.geometry("1380x860")
         self.minsize(950, 640)
         self.configure(bg="#1e1e1e")
@@ -211,6 +159,7 @@ class PAEApp(tk.Tk):
         self._timeline_total: float = 0.0
         self._timeline_ch_segs: List = []   # [(x1, x2, ch_idx)]
         self._timeline_seg_segs: List = []  # [(x1, x2, ch_idx, seg_idx, seg_dict)]
+        self._timeline_sil_segs: List = []  # [(x1, x2, start_s, end_s)]
 
         config_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "config.json")
         self.state = AppState(
@@ -243,6 +192,7 @@ class PAEApp(tk.Tk):
             with open(self.state.config_path, "w", encoding="utf-8") as f:
                 f.write(raw)
             self._refresh_videos_list()
+            self._sync_mode_selector()
             self._set_status("Config saved.")
         except json.JSONDecodeError as e:
             messagebox.showerror("JSON Error", str(e))
@@ -252,6 +202,7 @@ class PAEApp(tk.Tk):
         self._config_text.delete("1.0", "end")
         self._config_text.insert("1.0", self.state.config_raw)
         self._refresh_videos_list()
+        self._sync_mode_selector()
         self._set_status("Config reloaded.")
 
     def _browse_config(self):
@@ -262,6 +213,19 @@ class PAEApp(tk.Tk):
         if path:
             self.state.config_path = path
             self._reload_config()
+
+    def _current_silence_mode(self) -> str:
+        mode = (self.state.config.get("project") or {}).get("silence_removal", {}).get("mode", "off")
+        return mode if mode in SILENCE_MODES else "off"
+
+    def _sync_mode_selector(self):
+        if hasattr(self, "_mode_var"):
+            self._mode_var.set(self._current_silence_mode())
+
+    def _on_mode_change(self, _event=None):
+        proj = self.state.config.setdefault("project", {})
+        proj.setdefault("silence_removal", {})["mode"] = self._mode_var.get()
+        self._sync_config_from_state()
 
     def _configure_styles(self):
         s = ttk.Style(self)
@@ -301,6 +265,26 @@ class PAEApp(tk.Tk):
                  font=("Arial", 13, "bold")).pack(side="left")
         tk.Label(bar, text="Post Production Assistant", bg="#252526", fg="#777788",
                  font=("Arial", 9)).pack(side="left", padx=(8, 0))
+
+        tk.Label(bar, text="Silence removal:", bg="#252526", fg="#888899",
+                 font=("Arial", 9)).pack(side="left", padx=(24, 4))
+        self._mode_var = tk.StringVar(value=self._current_silence_mode())
+        mode_menu = ttk.Combobox(bar, textvariable=self._mode_var, values=SILENCE_MODES,
+                                 state="readonly", width=6, font=("Arial", 9))
+        mode_menu.pack(side="left", padx=2)
+        mode_menu.bind("<<ComboboxSelected>>", self._on_mode_change)
+
+        self._silence_only_btn = tk.Button(
+            bar, text="⚡ Silence Only", command=self._run_silence_only,
+            bg="#3c3c3c", fg="#d4d4d4", font=("Arial", 9, "bold"),
+            padx=10, pady=3, relief="flat", cursor="hand2")
+        self._silence_only_btn.pack(side="left", padx=(8, 2))
+
+        self._youtube_btn = tk.Button(
+            bar, text="📺 YouTube", command=self._on_youtube_automation_click,
+            bg="#3c3c3c", fg="#d4d4d4", font=("Arial", 9, "bold"),
+            padx=10, pady=3, relief="flat", cursor="hand2", state="disabled")
+        self._youtube_btn.pack(side="left", padx=(2, 2))
 
         self._stop_btn = tk.Button(
             bar, text="■  Stop", command=self._stop_run,
@@ -382,7 +366,7 @@ class PAEApp(tk.Tk):
         detail.pack(fill="x")
         tk.Label(detail, text="Selected video path:", bg="#252526",
                  fg="#888", font=("Arial", 8)).pack(anchor="w")
-        self._video_detail_var = tk.StringVar(value="—")
+        self._video_detail_var = tk.StringVar(value="-")
         tk.Label(detail, textvariable=self._video_detail_var, bg="#252526",
                  fg="#9cdcfe", font=("Consolas", 8), wraplength=350,
                  justify="left", anchor="w").pack(fill="x")
@@ -417,7 +401,7 @@ class PAEApp(tk.Tk):
         videos = (self.state.config.get("project") or {}).get("videos") or []
         if 0 <= idx < len(videos):
             pc = videos[idx].get("path") or {}
-            self._video_detail_var.set(pc.get("file") or pc.get("path") or "—")
+            self._video_detail_var.set(pc.get("file") or pc.get("path") or "-")
 
     def _on_video_double_click(self, event):
         sel = self._videos_tree.selection()
@@ -743,7 +727,7 @@ class PAEApp(tk.Tk):
             menu.add_separator()
             menu.add_command(label="Delete Chapter", command=self._delete_selected_chapter)
         else:
-            menu.add_command(label="(segment — read only)", state="disabled")
+            menu.add_command(label="(segment - read only)", state="disabled")
         try:
             menu.tk_popup(event.x_root, event.y_root)
         finally:
@@ -807,6 +791,8 @@ class PAEApp(tk.Tk):
     def _build_timeline_tab(self, parent):
         tab = tk.Frame(parent, bg="#1e1e1e")
 
+        self._build_preview_area(tab)
+
         legend_frame = tk.Frame(tab, bg="#1e1e1e")
         legend_frame.pack(fill="x", padx=8, pady=(6, 2))
         items = list(CHAPTER_COLORS.items())
@@ -838,29 +824,304 @@ class PAEApp(tk.Tk):
 
         return tab
 
+    def _build_preview_area(self, parent):
+        container = tk.Frame(parent, bg="#0a0a0a", height=260)
+        container.pack(fill="x", padx=8, pady=(6, 2))
+        container.pack_propagate(False)
+        self._preview_container = container
+
+        self._preview_progress_var = tk.DoubleVar(value=0.0)
+        self._preview_progress = ttk.Progressbar(
+            parent, orient="horizontal", mode="determinate",
+            maximum=100, variable=self._preview_progress_var)
+        # not packed - only shown while a compile is in flight
+
+        self._preview_thumb_label = tk.Label(
+            container, bg="#0a0a0a", fg="#666677",
+            text="Run the pipeline to see a preview here",
+            font=("Arial", 9), cursor="arrow", justify="center")
+        self._preview_thumb_label.pack(fill="both", expand=True)
+        self._preview_thumb_photo = None
+
+        self._preview_video_frame = tk.Frame(container, bg="black")
+        # not packed - only shown once a compile succeeds
+
+        self._preview_hint_label = tk.Label(
+            parent, text="", bg="#1e1e1e", fg="#666677", font=("Arial", 8))
+        self._preview_hint_label.pack(fill="x", padx=8)
+
+        self._preview_controls = tk.Frame(parent, bg="#1e1e1e")
+        self._preview_play_btn = tk.Button(
+            self._preview_controls, text="▶", command=self._toggle_playback,
+            bg="#3c3c3c", fg="#d4d4d4", font=("Arial", 9), width=3,
+            relief="flat", cursor="hand2")
+        self._preview_play_btn.pack(side="left", padx=(0, 6), pady=4)
+
+        self._preview_seek_var = tk.DoubleVar(value=0.0)
+        self._preview_seek = ttk.Scale(
+            self._preview_controls, from_=0, to=1000, orient="horizontal",
+            variable=self._preview_seek_var, command=self._on_seek_drag)
+        self._preview_seek.pack(side="left", fill="x", expand=True, padx=6, pady=4)
+        self._preview_seek.bind("<ButtonRelease-1>", self._on_seek_release)
+
+        self._preview_time_var = tk.StringVar(value="0:00 / 0:00")
+        tk.Label(self._preview_controls, textvariable=self._preview_time_var,
+                 bg="#1e1e1e", fg="#888899", font=("Consolas", 8)).pack(
+            side="left", padx=(0, 6))
+        # not packed - only shown once a compile succeeds
+
+        self._preview_seeking = False
+        self._preview_poll_job = None
+        self._vlc = None
+        self._vlc_instance = None
+        self._vlc_player = None
+        self._yt_log_fn = None
+
+        self._reset_preview_ui()
+
+    def _reset_preview_ui(self):
+        if self._preview_poll_job is not None:
+            self.after_cancel(self._preview_poll_job)
+            self._preview_poll_job = None
+        if self._vlc_player is not None:
+            try:
+                self._vlc_player.stop()
+            except Exception:
+                pass
+
+        self._preview_video_frame.pack_forget()
+        self._preview_controls.pack_forget()
+        self._preview_progress.pack_forget()
+        self._preview_progress_var.set(0.0)
+        self._preview_thumb_photo = None
+        self._preview_thumb_label.config(
+            image="", text="Running… preview will appear when done")
+        self._preview_thumb_label.pack(fill="both", expand=True)
+        self._preview_thumb_label.unbind("<Button-1>")
+        self._preview_hint_label.config(text="")
+
+    def _generate_thumbnail_async(self):
+        config = self.state.last_resolved_config
+        if not config:
+            return
+        border_images = list(self.state.border_images)
+
+        def _worker():
+            try:
+                from main import generate_thumbnail
+                path = generate_thumbnail(config, border_images)
+                self._queue.put((_MSG_THUMB_READY, path))
+            except Exception as e:
+                self._queue.put((_MSG_THUMB_ERROR, str(e)))
+
+        threading.Thread(target=_worker, daemon=True).start()
+
+    def _show_thumbnail(self, path: str):
+        try:
+            from PIL import Image, ImageTk
+            img = Image.open(path)
+            container_w = self._preview_container.winfo_width() or 480
+            w, h = img.size
+            scale = min(container_w / w, 250 / h, 1.0)
+            img = img.resize((max(1, int(w * scale)), max(1, int(h * scale))))
+            self._preview_thumb_photo = ImageTk.PhotoImage(img)
+            self._preview_thumb_label.config(image=self._preview_thumb_photo, text="")
+        except Exception as e:
+            self._preview_thumb_label.config(text=f"Thumbnail unavailable: {e}", image="")
+            return
+
+        self._preview_thumb_label.bind("<Button-1>", self._on_preview_click)
+        self._preview_hint_label.config(text="Click the preview above to compile a scrubbable, playable version.")
+
+    def _on_preview_click(self, event=None):
+        if self.state.running or not self.state.last_resolved_config or self.state.preview_path:
+            return
+
+        if not self._ensure_vlc():
+            self._preview_thumb_label.config(
+                text="VLC media player isn't installed - it's needed to play the compiled "
+                     "preview.\nInstall it from videolan.org, then click to try again.",
+                image="")
+            return
+
+        self._preview_thumb_label.unbind("<Button-1>")
+        self._preview_thumb_label.config(text="Compiling preview…", image="")
+        self._preview_thumb_photo = None
+        self._preview_hint_label.config(text="")
+        self._preview_progress_var.set(0.0)
+        self._preview_progress.pack(fill="x", padx=8, pady=(0, 4))
+
+        config = self.state.last_resolved_config
+        border_images = list(self.state.border_images)
+        silent_intervals = list(self.state.silent_intervals)
+
+        def _worker():
+            try:
+                from main import generate_preview
+
+                def _on_progress(fraction, stage):
+                    self._queue.put((_MSG_PREVIEW_PROGRESS, (fraction, stage)))
+
+                path = generate_preview(config, border_images, silent_intervals,
+                                        progress_callback=_on_progress)
+                self._queue.put((_MSG_PREVIEW_READY, path))
+            except Exception as e:
+                self._queue.put((_MSG_PREVIEW_ERROR, str(e)))
+
+        threading.Thread(target=_worker, daemon=True).start()
+
+    def _ensure_vlc(self) -> bool:
+        if self._vlc_instance is not None:
+            return True
+        try:
+            import vlc
+            self._vlc = vlc
+            self._vlc_instance = vlc.Instance()
+            self._vlc_player = self._vlc_instance.media_player_new()
+            return True
+        except Exception:
+            return False
+
+    def _on_youtube_automation_click(self):
+        config = self.state.last_resolved_config
+        if not config:
+            return
+        yt_cfg = (config.get("project") or {}).get("youtube_automation") or {}
+        if not yt_cfg.get("enabled"):
+            if not messagebox.askyesno(
+                "YouTube automation disabled",
+                "project.youtube_automation.enabled is false in this config.\n\n"
+                "Run it anyway for this session?"):
+                return
+
+        silent_intervals = list(self.state.silent_intervals)
+
+        dlg = tk.Toplevel(self)
+        dlg.title("YouTube Upload Automation")
+        dlg.configure(bg="#1e1e1e")
+        dlg.geometry("520x360")
+
+        tk.Label(dlg, text="Your actual Chrome window will open (same profile, cookies and "
+                           "all - close other Chrome windows first if prompted). Watch or "
+                           "take over any time; nothing is published automatically.",
+                bg="#1e1e1e", fg="#888899", font=("Arial", 9), wraplength=500,
+                justify="left").pack(fill="x", padx=10, pady=(10, 4))
+
+        log = scrolledtext.ScrolledText(
+            dlg, bg="#0d0d0d", fg="#d4d4d4", font=("Consolas", 9),
+            relief="flat", borderwidth=0, state="disabled")
+        log.pack(fill="both", expand=True, padx=10, pady=4)
+
+        def _log(line: str):
+            log.config(state="normal")
+            log.insert("end", line + "\n")
+            log.see("end")
+            log.config(state="disabled")
+
+        close_btn = tk.Button(dlg, text="Close", command=dlg.destroy,
+                              bg="#3c3c3c", fg="#d4d4d4", font=("Arial", 9),
+                              padx=10, pady=3, relief="flat", cursor="hand2")
+        close_btn.pack(pady=(4, 10))
+
+        self._youtube_btn.config(state="disabled")
+
+        def _worker():
+            try:
+                from main import run_youtube_automation
+
+                def _on_progress(step, message):
+                    self._queue.put((_MSG_YT_PROGRESS, f"[{step}] {message}"))
+
+                run_youtube_automation(config, silent_intervals, progress_callback=_on_progress)
+                self._queue.put((_MSG_YT_DONE, None))
+            except Exception as e:
+                self._queue.put((_MSG_YT_ERROR, str(e)))
+
+        self._yt_log_fn = _log
+        threading.Thread(target=_worker, daemon=True).start()
+
+    def _start_preview_playback(self, path: str):
+        if not self._ensure_vlc():
+            self._preview_thumb_label.config(
+                text="Compiled, but VLC media player isn't installed.\n"
+                     "Install it from videolan.org to enable scrub/play preview.",
+                image="")
+            self._preview_thumb_photo = None
+            return
+
+        self._preview_thumb_label.pack_forget()
+        self._preview_video_frame.pack(fill="both", expand=True)
+        self.update_idletasks()
+
+        media = self._vlc_instance.media_new(path)
+        self._vlc_player.set_media(media)
+        self._vlc_player.set_hwnd(self._preview_video_frame.winfo_id())
+        self._vlc_player.play()
+
+        self._preview_play_btn.config(text="⏸")
+        self._preview_controls.pack(fill="x", padx=8, pady=(2, 4))
+        self._start_preview_poll()
+
+    def _toggle_playback(self):
+        if not self._vlc_player:
+            return
+        if self._vlc_player.is_playing():
+            self._vlc_player.pause()
+            self._preview_play_btn.config(text="▶")
+        else:
+            self._vlc_player.play()
+            self._preview_play_btn.config(text="⏸")
+
+    def _start_preview_poll(self):
+        self._preview_poll_tick()
+
+    def _preview_poll_tick(self):
+        if self._vlc_player is not None and not self._preview_seeking:
+            length = self._vlc_player.get_length()
+            pos = self._vlc_player.get_time()
+            if length and length > 0:
+                self._preview_seek_var.set((pos / length) * 1000)
+                self._preview_time_var.set(f"{_fmt_time(pos / 1000)} / {_fmt_time(length / 1000)}")
+        self._preview_poll_job = self.after(300, self._preview_poll_tick)
+
+    def _on_seek_drag(self, _value):
+        self._preview_seeking = True
+
+    def _on_seek_release(self, _event=None):
+        if self._vlc_player is not None:
+            length = self._vlc_player.get_length()
+            if length and length > 0:
+                frac = self._preview_seek_var.get() / 1000.0
+                self._vlc_player.set_time(int(frac * length))
+        self._preview_seeking = False
+
     # Layout constants (canvas height = 210)
-    _CH_Y1, _CH_Y2   = 8,   72   # chapter blocks row
-    _SEG_Y1, _SEG_Y2 = 80, 145   # segment-type blocks row
-    _RULER_Y          = 155       # ruler tick base
+    _CH_Y1, _CH_Y2   = 8,   64   # chapter blocks row
+    _SEG_Y1, _SEG_Y2 = 70, 122   # segment-type blocks row
+    _SIL_Y1, _SIL_Y2 = 128, 148  # silence blocks row (solid grey preview)
+    _RULER_Y          = 158       # ruler tick base
 
     def _redraw_timeline(self):
         c = self._timeline_canvas
         c.delete("all")
         chapters = self.state.chapters
+        silences = self.state.silent_intervals
         w = c.winfo_width()
         h = c.winfo_height()
 
-        if not chapters or w < 2:
+        if (not chapters and not silences) or w < 2:
             c.create_text(w // 2, h // 2, text="No chapters",
                           fill="#444455", font=("Arial", 9))
             return
 
         ends = [_chapter_attr(ch, "end_time", "end") or 0 for ch in chapters]
+        ends += [e for _, e in silences]
         total = max(ends) if ends else 1
         self._timeline_total = total
 
         self._timeline_ch_segs  = []
         self._timeline_seg_segs = []
+        self._timeline_sil_segs = []
 
         for ci, ch in enumerate(chapters):
             st = _chapter_attr(ch, "start_time", "start") or 0
@@ -911,10 +1172,19 @@ class PAEApp(tk.Tk):
                               fill="#555566", width=2, dash=(3, 3),
                               tags=(f"boundary_{ci}",))
 
+        for s, e in silences:
+            sx1 = (s / total) * w
+            sx2 = (e / total) * w
+            c.create_rectangle(sx1, self._SIL_Y1, sx2, self._SIL_Y2,
+                               fill="#4a4a52", outline="#1e1e1e", width=1)
+            self._timeline_sil_segs.append((sx1, sx2, s, e))
+
         c.create_text(4, (self._CH_Y1 + self._CH_Y2) // 2,
                       text="Ch", fill="#555566", font=("Arial", 7), anchor="w")
         c.create_text(4, (self._SEG_Y1 + self._SEG_Y2) // 2,
                       text="Seg", fill="#555566", font=("Arial", 7), anchor="w")
+        c.create_text(4, (self._SIL_Y1 + self._SIL_Y2) // 2,
+                      text="Sil", fill="#555566", font=("Arial", 7), anchor="w")
 
         tick_interval = self._nice_interval(total)
         t = 0
@@ -958,7 +1228,7 @@ class PAEApp(tk.Tk):
                     st = _chapter_attr(ch, "start_time", "start") or 0
                     en = _chapter_attr(ch, "end_time",   "end")   or 0
                     self._timeline_tooltip.config(
-                        text=f"  {title}  —  {_fmt_time(st)} → {_fmt_time(en)}")
+                        text=f"  {title}  -  {_fmt_time(st)} → {_fmt_time(en)}")
                     return
         elif self._SEG_Y1 <= y <= self._SEG_Y2:
             for x1, x2, ci, si, seg in self._timeline_seg_segs:
@@ -969,8 +1239,14 @@ class PAEApp(tk.Tk):
                     en = seg.get("end_time", 0)
                     tip = f"  [{stype}]  {_fmt_time(st)} → {_fmt_time(en)}"
                     if summary:
-                        tip += f"  —  {summary[:60]}"
+                        tip += f"  -  {summary[:60]}"
                     self._timeline_tooltip.config(text=tip)
+                    return
+        elif self._SIL_Y1 <= y <= self._SIL_Y2:
+            for x1, x2, st, en in self._timeline_sil_segs:
+                if x1 <= x <= x2:
+                    self._timeline_tooltip.config(
+                        text=f"  [silence]  {_fmt_time(st)} → {_fmt_time(en)}")
                     return
         self._timeline_tooltip.config(text="")
 
@@ -1107,13 +1383,44 @@ class PAEApp(tk.Tk):
         import copy
         config = resolve_paths(copy.deepcopy(self.state.config))
         _assign_asset_ids(config)
+        self._run_config(config)
 
+    def _run_silence_only(self):
+        if self.state.running:
+            return
+
+        try:
+            raw = self._config_text.get("1.0", "end-1c")
+            base_config = json.loads(raw)
+        except json.JSONDecodeError as e:
+            messagebox.showerror("JSON Error", f"Invalid config:\n{e}")
+            return
+
+        if not (base_config.get("project") or {}).get("silence_only_profile"):
+            messagebox.showerror(
+                "Missing profile",
+                "This config has no project.silence_only_profile block to run.\n\n"
+                "Add one (see README), or use Browse… to load a config that does.")
+            return
+
+        from config import apply_profile, resolve_paths
+        from main import _assign_asset_ids
+        derived = apply_profile(base_config, "silence_only")
+        derived.setdefault("project", {}).setdefault("silence_removal", {})["mode"] = "only"
+        config = resolve_paths(derived)
+        _assign_asset_ids(config)
+        self._run_config(config)
+
+    def _run_config(self, config: Dict):
         self.state.reset_run()
+        self.state.last_resolved_config = config
+        self._reset_preview_ui()
         self._refresh_stages_ui()
         self._clear_log()
         self._clear_chapters()
         self._clear_cost()
         self._run_btn.config(state="disabled")
+        self._silence_only_btn.config(state="disabled")
         self._stop_btn.config(state="normal")
         self._set_status("Running…")
 
@@ -1139,9 +1446,10 @@ class PAEApp(tk.Tk):
         sys.stdout = self._orig_stdout
         self.state.running = False
         self._run_btn.config(state="normal")
+        self._silence_only_btn.config(state="normal")
         self._stop_btn.config(state="disabled")
         self._set_status("Stopped.")
-        self._append_log("— stopped by user —", tag="error")
+        self._append_log("- stopped by user -", tag="error")
 
     def _poll_queue(self):
         try:
@@ -1172,6 +1480,9 @@ class PAEApp(tk.Tk):
         elif kind == MSG_STAGE_DONE:
             self._set_stage(data, "done")
 
+        elif kind == MSG_STAGE_SKIP:
+            self._set_stage(data, "skipped")
+
         elif kind == MSG_STAGE_ERROR:
             stage_id, msg = data if isinstance(data, tuple) else (data, "")
             self._set_stage(stage_id, "error", msg)
@@ -1179,11 +1490,63 @@ class PAEApp(tk.Tk):
         elif kind == MSG_CHAPTERS:
             self._set_chapters(data)
 
+        elif kind == MSG_SILENCE:
+            self.state.silent_intervals = data or []
+            self._redraw_timeline()
+
+        elif kind == MSG_BORDERS:
+            self.state.border_images = data or []
+
         elif kind == MSG_DONE:
             self._on_done()
 
         elif kind == MSG_ERROR:
             self._on_error(str(data))
+
+        elif kind == _MSG_THUMB_READY:
+            self._show_thumbnail(data)
+
+        elif kind == _MSG_THUMB_ERROR:
+            self._preview_thumb_label.config(text=f"Thumbnail unavailable: {data}", image="")
+
+        elif kind == _MSG_PREVIEW_PROGRESS:
+            fraction, stage = data
+            self._preview_progress_var.set(max(0.0, min(1.0, fraction)) * 100)
+            self._preview_thumb_label.config(text=f"Compiling preview… {stage} ({fraction * 100:.0f}%)")
+
+        elif kind == _MSG_PREVIEW_READY:
+            self.state.preview_path = data
+            self._preview_progress.pack_forget()
+            self._start_preview_playback(data)
+
+        elif kind == _MSG_PREVIEW_ERROR:
+            self._preview_progress.pack_forget()
+            self._preview_thumb_label.config(
+                text=f"Compile failed: {data}\n(click to retry)", image="")
+            self._preview_thumb_label.bind("<Button-1>", self._on_preview_click)
+
+        elif kind == _MSG_YT_PROGRESS:
+            if self._yt_log_fn:
+                try:
+                    self._yt_log_fn(str(data))
+                except tk.TclError:
+                    pass  # dialog was closed
+
+        elif kind == _MSG_YT_DONE:
+            if self._yt_log_fn:
+                try:
+                    self._yt_log_fn("\nDone - browser left open for you to review/finish publishing.")
+                except tk.TclError:
+                    pass
+            self._youtube_btn.config(state="normal")
+
+        elif kind == _MSG_YT_ERROR:
+            if self._yt_log_fn:
+                try:
+                    self._yt_log_fn(f"\nERROR: {data}")
+                except tk.TclError:
+                    pass
+            self._youtube_btn.config(state="normal")
 
     def _set_stage(self, stage_id: str, status: str, message: str = ""):
         for s in self.state.stages:
@@ -1256,7 +1619,7 @@ class PAEApp(tk.Tk):
                 sen   = seg.get("end_time", end)
                 sdur  = sen - sst if sen > sst else 0
                 summary = seg.get("summary", "")
-                label = stype if not summary else f"{stype} — {summary[:40]}"
+                label = stype if not summary else f"{stype} - {summary[:40]}"
                 self._chapters_tree.insert(
                     ch_iid, "end",
                     text=f"  {label}",
@@ -1290,6 +1653,7 @@ class PAEApp(tk.Tk):
         sys.stdout = self._orig_stdout
         self.state.running = False
         self._run_btn.config(state="normal")
+        self._silence_only_btn.config(state="normal")
         self._stop_btn.config(state="disabled")
 
         costs = []
@@ -1302,17 +1666,20 @@ class PAEApp(tk.Tk):
                     pass
         total = max(costs) if costs else 0.0
         self.state.total_cost = total
-        cost_str = f"${total:.4f}" if total else "—"
+        cost_str = f"${total:.4f}" if total else "-"
         self._set_status(f"Done  ·  cost {cost_str}")
         self._append_log("\n✓ Processing complete.", tag="success")
+        self._generate_thumbnail_async()
+        self._youtube_btn.config(state="normal")
 
     def _on_error(self, msg: str):
         sys.stdout = self._orig_stdout
         self.state.running = False
         self.state.error = msg
         self._run_btn.config(state="normal")
+        self._silence_only_btn.config(state="normal")
         self._stop_btn.config(state="disabled")
-        self._set_status("Error — see log")
+        self._set_status("Error - see log")
         self._append_log(f"\n[ERROR] {msg}", tag="error")
         for s in self.state.stages:
             if s.status == "running":
