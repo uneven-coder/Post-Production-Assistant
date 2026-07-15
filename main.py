@@ -3,6 +3,7 @@ import json
 import os
 import queue
 import shutil
+import threading
 from datetime import datetime
 
 from config import get_config, resolve_paths, apply_profile
@@ -522,6 +523,122 @@ def run_headless(config_path: str, force_silence_only: bool = False) -> None:
             close_all_sessions()
 
 
+_YOUTUBE_SILENT_ONLY_STAGE_LABELS = {
+    "silence": "Detecting silence",
+    "borders": "Processing borders",
+    "transcript": "Transcribing audio",
+    "chapters": "Generating chapters",
+    "timeline": "Building timeline",
+    "tests": "Running tests",
+}
+
+
+def run_youtube_silent_only(config_path: str) -> None:
+    # Reads a YouTube Studio URL from the clipboard, downloads that video via Studio's
+    # own Download action, runs the silence-only pipeline on it locally, then opens
+    # that same video's Trim & cut editor and applies the detected cuts automatically -
+    # no re-upload (it's already live) and no manual step to trigger the cut markup.
+    from silence.detector import _probe_duration
+    from youtube_automation.source_url import get_clipboard_text, extract_video_id
+    from youtube_automation import driver as yt_driver
+
+    def cli_report(step, message):
+        print(f"  [{step}] {message}")
+
+    text = get_clipboard_text()
+    video_id = extract_video_id(text)
+    if not video_id:
+        print("[FAIL] No YouTube video URL found on the clipboard.\n       "
+              "Copy something like https://studio.youtube.com/video/VIDEO_ID/edit "
+              "and try again.")
+        return
+    print(f"Found video ID: {video_id}")
+
+    with open(config_path, "r", encoding="utf-8") as f:
+        raw_config = json.load(f)
+
+    if not (raw_config.get("project") or {}).get("youtube_silent_only_profile"):
+        print("[FAIL] config.json has no project.youtube_silent_only_profile block - see README.")
+        return
+
+    derived = apply_profile(raw_config, "youtube_silent_only")
+    derived.setdefault("project", {}).setdefault("silence_removal", {})["mode"] = "only"
+
+    dl_cfg = derived.get("project", {}).get("youtube_download", {}) or {}
+    download_dir = os.path.abspath(dl_cfg.get("download_directory", "./videos/youtube_downloads/"))
+
+    print("\n-> download...")
+    try:
+        video_path, pw, context, page = yt_driver.download_studio_video(
+            video_id, download_dir, progress_callback=cli_report)
+    except yt_driver.AutomationError as e:
+        print(f"[FAIL] download: {e}")
+        return
+
+    derived["project"]["videos"] = [{
+        "path": {"path": video_path},
+        "tags": ["audio_source", "main"],
+        "overlay": {"x": 0.0, "y": 0.0, "width": 1.0, "height": 1.0, "border": {"enabled": False}},
+    }]
+
+    config = resolve_paths(derived)
+    _assign_asset_ids(config)
+
+    def _pipeline_report(kind, data) -> None:
+        _print_stage_event(kind, data)
+        # Only MSG_STAGE_START/DONE carry a plain stage-id string in `data` - other
+        # kinds (MSG_SILENCE's list of intervals, MSG_CHAPTERS's list, etc.) aren't even
+        # hashable, so the label lookup must stay inside these two branches.
+        if kind == MSG_STAGE_START:
+            label = _YOUTUBE_SILENT_ONLY_STAGE_LABELS.get(data, data)
+            yt_driver._update_progress_bar(page, f"PAE: {label}...")
+        elif kind == MSG_STAGE_DONE:
+            label = _YOUTUBE_SILENT_ONLY_STAGE_LABELS.get(data, data)
+            yt_driver._update_progress_bar(page, f"PAE: {label} done")
+
+    q: "queue.Queue" = queue.Queue()
+    worker = ProcessingWorker(q, config)
+    worker_thread = threading.Thread(target=worker.run, daemon=True)
+    worker_thread.start()
+
+    silent_intervals: list = []
+    ok = True
+    while worker_thread.is_alive() or not q.empty():
+        try:
+            kind, data = q.get(timeout=0.2)
+        except queue.Empty:
+            continue
+        if kind == MSG_SILENCE:
+            silent_intervals = data or []
+        elif kind == MSG_ERROR:
+            ok = False
+        _pipeline_report(kind, data)
+
+    if not ok:
+        print("[FAIL] Pipeline failed - not opening the Trim & cut editor.")
+        yt_driver._update_progress_bar(page, "PAE: pipeline failed - see console")
+        return
+
+    yt_cfg = config["project"].get("youtube_automation", {}) or {}
+    cuts = yt_driver.reduce_cuts_for_studio(
+        silent_intervals, min_duration_s=yt_cfg.get("min_cut_duration_s", 1.0),
+        max_merge_gap_s=yt_cfg.get("max_merge_gap_s", 0.35))
+    duration = _probe_duration(video_path)
+
+    print(f"\n-> Opening the Trim & cut editor for {video_id} and applying "
+          f"{len(cuts)} cut(s) automatically...")
+    try:
+        yt_driver.finish_editing_existing_video(
+            page, video_id, cuts, duration, progress_callback=cli_report)
+    except yt_driver.AutomationError as e:
+        print(f"[FAIL] youtube_automation: {e}")
+        return
+
+    input("\nBrowser window left open for you to review/finish publishing - "
+          "press Enter here to close this automation session.\n")
+    yt_driver.close_all_sessions()
+
+
 if __name__ == "__main__":
     import argparse
 
@@ -532,12 +649,20 @@ if __name__ == "__main__":
     parser.add_argument("--silence-only", action="store_true",
                          help="Shortcut: applies the config's project.silence_only_profile "
                               "override (if present) and forces silence_removal.mode to 'only'")
+    parser.add_argument("--youtube-silent-only", action="store_true",
+                         help="Reads a YouTube Studio URL from the clipboard, downloads "
+                              "that video, runs the silence-only pipeline on it, then "
+                              "opens its Trim & cut editor and applies the cuts "
+                              "automatically - no re-upload, since it's already on YouTube")
     args = parser.parse_args()
 
+    here = os.path.dirname(os.path.abspath(__file__))
+    cfg_path = args.config or os.path.join(here, "config.json")
+
     if args.run or args.silence_only:
-        here = os.path.dirname(os.path.abspath(__file__))
-        cfg_path = args.config or os.path.join(here, "config.json")
         run_headless(cfg_path, force_silence_only=args.silence_only)
+    elif args.youtube_silent_only:
+        run_youtube_silent_only(cfg_path)
     else:
         from app import main
         main()

@@ -23,10 +23,11 @@ cp .env.example .env
 ## Usage
 
 ```bash
-python main.py                    # opens the UI
-python main.py --run              # headless run of config.json, no UI
-python main.py --config PATH      # headless run of a specific config file
-python main.py --silence-only     # headless run of config.json's silence_only_profile, silence-only
+python main.py                       # opens the UI
+python main.py --run                 # headless run of config.json, no UI
+python main.py --config PATH         # headless run of a specific config file
+python main.py --silence-only        # headless run of config.json's silence_only_profile, silence-only
+python main.py --youtube-silent-only # download a YouTube video from your clipboard, silence-only, then edit its cuts - see below
 ```
 
 **important** The default config refrences videos from a non accessible folder so make sure to change this before using.
@@ -59,6 +60,8 @@ All settings live in `config.json`. Key fields:
 | `silence_removal.threshold_db` | Volume below which audio is considered silent (default `-35`) |
 | `silence_removal.padding_s` | Seconds trimmed off each edge of a detected silence window so speech isn't clipped (default `0.12`) |
 | `silence_only_profile` | Optional override block applied on top of `project` for `--silence-only` / **⚡ Silence Only** - see [Silence removal](#silence-removal) |
+| `youtube_silent_only_profile` | Optional override block for `--youtube-silent-only` - see [YouTube Silent-Only Shortcut](#youtube-silent-only-shortcut) |
+| `youtube_download.download_directory` | Where `--youtube-silent-only` saves the downloaded video, default `./videos/youtube_downloads/` |
 
 ### Output folder naming
 
@@ -122,6 +125,29 @@ python main.py --silence-only
 
 Alternatively, you can double-click `remove_silence.bat` or click **Silence Only** in the UI toolbar. All three methods apply `silence_only_profile` on top of `config.json` and force `silence_removal.mode` to `"only"` without changing what is saved to disk or displayed in the Config tab.
 
+### YouTube Silent-Only Shortcut
+
+Same idea as the shortcut above, but for a video that's *already* on YouTube instead of a local file:
+
+1. Copy a YouTube Studio URL to your clipboard - `https://studio.youtube.com/video/VIDEO_ID/edit`, a live stream's URL, or a plain `youtube.com/watch?v=` / `youtu.be` link all work.
+2. Run `python main.py --youtube-silent-only`, or double-click `youtube_silent_only.bat`.
+
+It then, in order:
+
+1. Reads the video ID from the clipboard.
+2. Downloads the original file via YouTube Studio's own **⋮ → Download** action into `youtube_download.download_directory` (default `./videos/youtube_downloads/`).
+3. Runs the silence-only pipeline on that download, applying `project.youtube_silent_only_profile` (a `silence_removal.mode: "only"` override, same shallow-merge behavior as `silence_only_profile`).
+4. Opens that same video's **Editor → Trim & cut** panel and shows a live progress bar directly on the page (download %, then pipeline stage). Once cuts are known, it applies every one of them automatically - no button, no click - then plays a notification sound when done. Because the video is already uploaded, there's no re-upload step.
+
+```json
+"youtube_silent_only_profile": {
+  "silence_removal": { "mode": "only" }
+},
+"youtube_download": {
+  "download_directory": "./videos/youtube_downloads/"
+}
+```
+
 ---
 
 ## Timeline Preview
@@ -174,18 +200,20 @@ The automation:
 
 It intentionally does **not** click the Cuts editor's **Save** button. This final review and confirmation step is left to the user.
 
-You can launch automation from the **YouTube** toolbar button (available once a run has completed) or automatically via `remove_silence.bat` or `python main.py --silence-only` when `auto_launch_on_silence_only` is enabled.
+You can launch automation from the **YouTube** toolbar button at any time - it opens a dialog to pick which output to use (whatever you just ran this session, or any past output on disk) before starting - or automatically via `remove_silence.bat` or `python main.py --silence-only` when `auto_launch_on_silence_only` is enabled.
 
 Once automation completes, the console pauses and waits for user input so the browser window remains open while you review, edit, or publish the video.
 
 ### Caveats
 
-* YouTube Studio's interface can change without notice. The automation targets accessible labels and roles rather than CSS selectors wherever possible. If a step fails, it degrades gracefully by displaying the relevant timestamps so they can be applied manually.
+* Cuts are applied by calling the Trim & cut panel's own internal component methods directly (`addNewCutAtTime`/`approveCutById` etc. on its underlying element) rather than clicking through the UI - this is dramatically faster for large cut counts, but it's an undocumented internal API rather than a stable public one, so a YouTube Studio update is more likely to break it silently than a labels/roles-based approach would. If a cut fails to apply, the failure is reported (which cut, and the underlying JS error) rather than applied manually.
 * Automating uploads on a personal account exists in a grey area of YouTube's terms regarding automated access. This feature is intended for individual workflows and is not designed for large-scale automation.
 * Requires Google Chrome or Microsoft Edge to be installed locally.
 * Chrome must not already be running when automation starts. If Chrome is open, the browser may briefly appear and close immediately, followed by a `"profile already open"` error on subsequent runs.
 * If Chrome continues running in the background after all windows have been closed, disable **Continue running background apps when Google Chrome is closed** (`chrome://settings/system`) and terminate any remaining `chrome.exe` processes using Task Manager.
 * Run PAE from a standard, non-elevated terminal. Running as Administrator causes Chrome to disable its sandbox and display an "unsupported command-line flag" warning banner on every launch.
+* `--youtube-silent-only` reads the video URL from the clipboard (`Ctrl+C` it yourself before running) - it does not attempt to read whatever's currently selected on screen.
+* `--youtube-silent-only` requires the signed-in automation profile to have access to the video (i.e. own or manage it) - Studio's Download action isn't available otherwise. Its menu/download selectors are just as best-effort as the rest of this feature; if Studio's layout changes, download it manually instead.
 
 
 ## Output
@@ -208,12 +236,13 @@ chapters/           Transcript segmentation and chapter title generation
 premiere/           XMEML timeline builder
 silence/            ffmpeg + unsilence-based silence detection and trimming
 preview/            ffmpeg-based Timeline tab scrub/play preview renderer
-youtube_automation/ Playwright-driven YouTube Studio upload + Cuts automation
+youtube_automation/ Playwright-driven YouTube Studio upload/download + Cuts automation
 tests/              Smoke tests (run via unittest discover)
 assets/             9-patch PNGs, fonts
 config.json         Project configuration (includes the silence_only_profile override)
 config.py           Config loading, profile overrides, and path resolution
 main.py             Pipeline orchestrator + headless CLI
 app.py              Tkinter UI
-remove_silence.bat  Double-click shortcut for --silence-only
+remove_silence.bat          Double-click shortcut for --silence-only
+youtube_silent_only.bat     Double-click shortcut for --youtube-silent-only
 ```

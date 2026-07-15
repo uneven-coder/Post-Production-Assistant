@@ -50,8 +50,26 @@ def silent_intervals(
     padding_s: float = 0.12,
 ) -> list[tuple[float, float]]:
     # Main entrypoint: detects silent windows, already merged/padded via unsilence's optimizer.
-    intervals = _detect_raw_intervals(file_path, threshold_db, min_duration_s)
-    intervals.optimize(short_interval_threshold=min_duration_s, stretch_time=padding_s * 2)
+    raw = _detect_raw_intervals(file_path, threshold_db, min_duration_s)
+    intervals = raw.copy()
+    try:
+        intervals.optimize(short_interval_threshold=min_duration_s, stretch_time=padding_s * 2)
+    except Exception as e:
+        print(f"[warn] Silence padding step failed ({e}) - retrying without padding.")
+        intervals = raw.copy()
+        try:
+            intervals.optimize(short_interval_threshold=min_duration_s, stretch_time=0)
+        except Exception as e2:
+            # unsilence's own combine step can itself produce a zero-duration interval
+            # (a merge artifact from clustered start/end events), which then blows up
+            # enlarge_audible_interval() even with stretch_time=0 - optimize() offers no
+            # further fallback at that point. Falling back to the raw, un-merged detect
+            # output keeps the pipeline running instead of failing the whole run; it just
+            # means silence boundaries won't be padded/merged as tightly this time.
+            print(f"[warn] Silence merge step also failed ({e2}) - using raw, "
+                  f"un-merged intervals instead.")
+            intervals = raw
+
     return [(iv.start, iv.end) for iv in intervals.intervals if iv.is_silent and iv.end > iv.start]
 
 

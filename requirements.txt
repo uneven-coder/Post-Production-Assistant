@@ -11,3 +11,4 @@ unsilence
 python-vlc
 playwright
 pyautogui
+requests

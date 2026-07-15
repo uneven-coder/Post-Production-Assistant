@@ -308,35 +308,26 @@ def _watch_for_file_dialog(video_path: str, root_pid: Optional[int], report: Cal
         stop_event.wait(0.3)
 
 
-def _seconds_to_timestamp(seconds: float) -> str:
-    total = max(0, int(round(seconds)))
-    minutes, secs = divmod(total, 60)
-    return f"{min(minutes, 99):02d}:{secs:02d}:00"  # Cuts tab fields are MM:SS:FF
-
-
-def _type_timestamp(page, input_locator, seconds: float) -> None:
-    input_locator.click(timeout=10000, click_count=3)  # triple-click selects all
-    page.keyboard.type(_seconds_to_timestamp(seconds))
-    page.keyboard.press("Tab")
-
-
-def _seek_playhead(page, seconds: float) -> None:
-    _type_timestamp(page, page.locator("#left-controls ytcp-media-timestamp-input input").first, seconds)
-
-
-def _current_cut_row(page):
-    # Cuts always seek forward before splitting, so the row still being edited (not yet
-    # collapsed behind `hidden`) is always the last one - cheaper than scanning with :has().
-    last_row = page.locator(".cut-row").last
-    if last_row.locator(".cut-framestamps-container:not([hidden])").count() > 0:
-        return last_row
-    return page.locator(".cut-row:has(.cut-framestamps-container:not([hidden]))").first
-
-
-def _set_cut_end_and_confirm(page, cut_row, end_seconds: float) -> None:
-    end_input = cut_row.locator(".cut-framestamps-container ytcp-media-timestamp-input input").nth(1)
-    _type_timestamp(page, end_input, end_seconds)
-    cut_row.locator("#approve-cut-button").click(timeout=8000)
+_APPLY_CUTS_JS = """
+(cuts) => {
+  const el = document.querySelector('ytve-trim-options-panel');
+  if (!el) return {panelMissing: true};
+  const results = [];
+  for (const [startMs, endMs] of cuts) {
+    try {
+      el.addNewCutAtTime(startMs);
+      const idx = el.cuts.length - 1;
+      const cutId = el.cuts[idx].id;
+      el.set('cuts.' + idx + '.endMs', endMs);
+      el.approveCutById(cutId);
+      results.push({ok: true});
+    } catch (e) {
+      results.push({ok: false, error: String(e)});
+    }
+  }
+  return {results};
+}
+"""
 
 
 def _safe_reinject(page, init_js: str) -> None:
@@ -346,7 +337,12 @@ def _safe_reinject(page, init_js: str) -> None:
         pass
 
 
-def _inject_helper_buttons(page, report: Callable, cuts: list, duration: float):
+_UPLOAD_HINT = ("PAE: video auto-attaches once you open Chrome's file picker - use this "
+                "button once you're on the Cuts tab")
+
+
+def _inject_helper_buttons(page, report: Callable, cuts: list, duration: float,
+                           hint_text: str = _UPLOAD_HINT):
     # expose_function callbacks run on Playwright's own dispatcher thread; calling other
     # sync-API methods from inside one deadlocks it. So the exposed function only
     # enqueues the request - _pump_button_actions does the actual work.
@@ -368,30 +364,34 @@ def _inject_helper_buttons(page, report: Callable, cuts: list, duration: float):
             _report_cuts("No silence cuts to apply - silent_intervals is empty for this "
                          "session (run silence detection first).")
             return "No silence cuts to apply"
-        for i, (s, e) in enumerate(cuts, 1):
-            s, e = max(0.0, s), min(duration, e)
-            progress = f"Cut {i}/{len(cuts)}: {s:.1f}s - {e:.1f}s..."
-            if i == 1 or i % 10 == 0:  # page.evaluate() per cut adds up over a few hundred
-                _report_cuts(progress)
-            else:
-                report("cuts", progress)
-            try:
-                _seek_playhead(page, s)
-            except Exception as ex:
-                _report_cuts(f"Cut {i}/{len(cuts)}: failed seeking playhead to {s:.1f}s - {ex}")
-                return f"Error on cut {i}: seek playhead - {ex}"
-            try:
-                page.locator("#new-cut-button").click(timeout=10000)
-            except Exception as ex:
-                _report_cuts(f"Cut {i}/{len(cuts)}: failed clicking New Cut - {ex}")
-                return f"Error on cut {i}: New Cut - {ex}"
-            try:
-                _set_cut_end_and_confirm(page, _current_cut_row(page), e)
-            except Exception as ex:
-                _report_cuts(f"Cut {i}/{len(cuts)}: failed setting end/confirming - {ex}")
-                return f"Error on cut {i}: set end/confirm - {ex}"
+
+        ms_pairs = [(round(max(0.0, s) * 1000), round(min(duration, e) * 1000)) for s, e in cuts]
+        _report_cuts(f"Applying {len(ms_pairs)} cut(s)...")
+        try:
+            outcome = page.evaluate(_APPLY_CUTS_JS, ms_pairs)
+        except Exception as ex:
+            _report_cuts(f"Failed to apply cuts - {ex}")
+            return f"Error applying cuts: {ex}"
+
+        if outcome.get("panelMissing"):
+            msg = ("Couldn't find the Trim & cut panel on this page - make sure you're "
+                   "on Editor > Trim & cut before clicking Edit Timeline.")
+            _report_cuts(msg)
+            return msg
+
+        results = outcome["results"]
+        failed = [(i, r) for i, r in enumerate(results, 1) if not r.get("ok")]
+        ok_count = len(results) - len(failed)
+
+        if failed:
+            first_i, first = failed[0]
+            msg = (f"{ok_count}/{len(cuts)} cuts applied - {len(failed)} failed "
+                   f"(first at cut {first_i}: {first.get('error')})")
+            _report_cuts(msg)
+            return msg
+
         _report_cuts("All cuts marked up - review and click Save yourself.")
-        return f"{len(cuts)} cuts applied - review and Save"
+        return f"{ok_count} cuts applied - review and Save"
 
     def trigger_apply_cuts() -> str:
         report("cuts", "Edit Timeline clicked - queued for processing...")
@@ -416,7 +416,7 @@ def _inject_helper_buttons(page, report: Callable, cuts: list, duration: float):
         'display:flex;flex-direction:column;align-items:flex-end;gap:6px;' +
         'font-family:Roboto,Arial,sans-serif;';
       const hint = document.createElement('div');
-      hint.textContent = "PAE: video auto-attaches once you open Chrome's file picker - use this button once you're on the Cuts tab";
+      hint.textContent = "__PAE_HINT__";
       hint.style.cssText = 'background:#222;color:#ddd;padding:4px 10px;border-radius:4px;' +
         'font-size:11px;box-shadow:0 2px 8px rgba(0,0,0,.35);';
       const bar = document.createElement('div');
@@ -470,7 +470,7 @@ def _inject_helper_buttons(page, report: Callable, cuts: list, duration: float):
   }
 })();
 """
-    init_js = init_js.replace("__PAE_CUT_COUNT__", str(len(cuts)))
+    init_js = init_js.replace("__PAE_CUT_COUNT__", str(len(cuts))).replace("__PAE_HINT__", hint_text)
     page.add_init_script(init_js)  # survives full reloads/navigations
     _safe_reinject(page, init_js)  # and applies immediately to what's already loaded
     page.on("framenavigated", lambda frame: (
@@ -547,23 +547,11 @@ def _pump_all_pages(context, report: Callable, cuts: list, duration: float,
         time.sleep(0.2)
 
 
-def run_automation(
-    video_path: str, cuts: list, duration: float, *,
-    profile_root: str = None, profile_name: str = "Default",
-    browser_channel: str = "chrome", headless: bool = False,
-    progress_callback: ProgressCallback = None,
-) -> None:
-    # Opens YouTube Studio; a background thread fills in Chrome's file-picker and a
-    # floating "Edit Timeline" button applies `cuts` on every open Cuts tab. Runs
-    # synchronously until every browser tab is closed. Uses a dedicated automation
-    # profile - login is a one-time manual step since Google blocks CDP-attached sign-ins.
-    def report(step: str, message: str):
-        if progress_callback:
-            progress_callback(step, message)
-
-    if not os.path.exists(video_path):
-        raise AutomationError(f"Video file not found: {video_path}")
-
+def _open_automation_browser(profile_root: Optional[str], profile_name: str,
+                             browser_channel: str, headless: bool, report: Callable):
+    # Shared by run_automation and download_studio_video - both need the identical
+    # dedicated automation profile (login is a one-time manual step since Google blocks
+    # CDP-attached sign-ins), just pointed at different pages afterwards.
     if _is_elevated():
         report("launch", "Warning: this is running as Administrator - Chrome disables its "
                           "sandbox when launched from an elevated process (you'll see its "
@@ -587,12 +575,33 @@ def run_automation(
             f"yourself by running: chrome.exe --user-data-dir=\"{profile_root}\" "
             f"--profile-directory=\"{profile_name}\" - then try again.")
 
-    try:
-        report("launch", f"Opening Chrome (profile: {profile_root}\\{profile_name})...")
-        pw, context = _launch_context(profile_root, profile_name, browser_channel, headless, report)
-        report("launch", "Browser ready.")
+    report("launch", f"Opening Chrome (profile: {profile_root}\\{profile_name})...")
+    pw, context = _launch_context(profile_root, profile_name, browser_channel, headless, report)
+    report("launch", "Browser ready.")
+    _ACTIVE_SESSIONS.append((pw, context))
+    return pw, context, profile_root
 
-        _ACTIVE_SESSIONS.append((pw, context))
+
+def run_automation(
+    video_path: str, cuts: list, duration: float, *,
+    profile_root: str = None, profile_name: str = "Default",
+    browser_channel: str = "chrome", headless: bool = False,
+    progress_callback: ProgressCallback = None,
+) -> None:
+    # Opens YouTube Studio; a background thread fills in Chrome's file-picker and a
+    # floating "Edit Timeline" button applies `cuts` on every open Cuts tab. Runs
+    # synchronously until every browser tab is closed. Uses a dedicated automation
+    # profile - login is a one-time manual step since Google blocks CDP-attached sign-ins.
+    def report(step: str, message: str):
+        if progress_callback:
+            progress_callback(step, message)
+
+    if not os.path.exists(video_path):
+        raise AutomationError(f"Video file not found: {video_path}")
+
+    try:
+        pw, context, profile_root = _open_automation_browser(
+            profile_root, profile_name, browser_channel, headless, report)
 
         # Registered before reading context.pages, so a tab created in that exact gap
         # (e.g. Chrome still restoring a previous session) can't be missed by both.
@@ -631,6 +640,260 @@ def run_automation(
     except Exception as e:
         report("error", f"Unexpected error: {e}")
         raise
+
+
+_PROGRESS_BAR_BUILD_JS = """
+  const bar = document.createElement('div');
+  bar.id = '__pae_progress_bar';
+  bar.style.cssText = 'position:fixed;bottom:16px;right:16px;z-index:2147483647;' +
+    'background:#111;color:#8f8;padding:8px 14px;border-radius:6px;' +
+    'font-family:Roboto,Arial,sans-serif;font-size:12px;max-width:340px;' +
+    'text-align:right;box-shadow:0 2px 8px rgba(0,0,0,.35);';
+  const barLabel = document.createElement('div');
+  barLabel.id = '__pae_progress_label';
+  barLabel.textContent = 'PAE: starting...';
+  const barTrack = document.createElement('div');
+  barTrack.style.cssText = 'width:100%;height:4px;background:#333;border-radius:2px;' +
+    'margin-top:6px;overflow:hidden;';
+  const barFill = document.createElement('div');
+  barFill.id = '__pae_progress_fill';
+  barFill.style.cssText = 'height:100%;width:0%;background:#4caf50;transition:width .25s ease;';
+  barTrack.appendChild(barFill);
+  bar.appendChild(barLabel);
+  bar.appendChild(barTrack);
+  document.body.appendChild(bar);
+"""
+
+
+def _inject_progress_bar(page) -> None:
+    js = "(() => { if (document.getElementById('__pae_progress_bar')) return;" + _PROGRESS_BAR_BUILD_JS + "})();"
+    try:
+        page.evaluate(js)
+    except Exception:
+        pass
+
+
+def _update_progress_bar(page, message: str, pct: Optional[float] = None) -> None:
+    js = (
+        "([msg, pct]) => {"
+        "  let el = document.getElementById('__pae_progress_bar');"
+        "  if (!el && document.body) {" + _PROGRESS_BAR_BUILD_JS + "el = document.getElementById('__pae_progress_bar'); }"
+        "  if (!el) return;"
+        "  const label = el.querySelector('#__pae_progress_label');"
+        "  if (label) label.textContent = msg;"
+        "  if (pct !== null && pct !== undefined) {"
+        "    const fill = el.querySelector('#__pae_progress_fill');"
+        "    if (fill) fill.style.width = Math.max(0, Math.min(100, pct)) + '%';"
+        "  }"
+        "}"
+    )
+    try:
+        page.evaluate(js, [message, pct])
+    except Exception:
+        pass
+
+
+def _remove_progress_bar(page) -> None:
+    try:
+        page.evaluate(
+            "() => { const el = document.getElementById('__pae_progress_bar'); "
+            "if (el) el.remove(); }")
+    except Exception:
+        pass
+
+
+def _notify_done() -> None:
+    if sys.platform != "win32":
+        return
+    try:
+        import winsound
+        winsound.MessageBeep(winsound.MB_ICONASTERISK)
+    except Exception:
+        pass
+
+
+_MENU_BUTTON_SELECTOR = (
+    # Verified against the live Details (/edit) page: the video-level actions menu is
+    # <ytcp-icon-button id="overflow-menu-button" aria-label="Options"> inside
+    # <ytcp-video-overflow-menu>. Studio also renders several other aria-label="Options"
+    # buttons on the same page (suggestion panels, thumbnail rows) that are hidden via
+    # CSS rather than absent - ":visible" and the specific id keep .first from landing on
+    # one of those instead.
+    'ytcp-icon-button#overflow-menu-button:visible, '
+    'ytcp-video-overflow-menu [aria-label="Options"]:visible, '
+    'ytcp-icon-button#menu-button:visible, ytcp-button#menu-button:visible, '
+    'button[aria-label*="More actions" i]:visible, button[aria-label="Options"]:visible'
+)
+
+
+def _trigger_native_download(page, report: Callable):
+    # Opens the video's "more actions" (⋮) menu and clicks its Download item -
+    # studio.youtube.com renders that item as
+    # <tp-yt-paper-item test-id="VIDEO_DOWNLOAD"><a href="...download_my_video?...">.
+    #
+    # Must be a real click wrapped in page.expect_download(), not a GET on the href
+    # via a separate requests session with copied cookies
+    report("download", "Opening the video's options menu...")
+    menu_button = page.locator(_MENU_BUTTON_SELECTOR).first
+    try:
+        menu_button.wait_for(state="visible", timeout=20000)
+        menu_button.click(timeout=15000)
+    except Exception as e:
+        raise AutomationError(
+            "Couldn't find the video's options (...) menu button - YouTube Studio's layout "
+            "may have changed. Download the video manually and place it in the download "
+            f"directory, or check youtube_automation/driver.py's _MENU_BUTTON_SELECTOR. ({e})")
+
+    item = page.locator('[test-id="VIDEO_DOWNLOAD"] a').first
+    try:
+        item.wait_for(state="visible", timeout=15000)
+    except Exception:
+        raise AutomationError(
+            "Couldn't find the Download option in the video's options menu - YouTube "
+            "Studio's layout may have changed. Download the video manually and place it "
+            "in the download directory, or check youtube_automation/driver.py's "
+            "_trigger_native_download() selectors.")
+
+    report("download", "Starting download...")
+    try:
+        with page.expect_download(timeout=600000) as download_info:
+            item.click(timeout=10000)
+    except Exception as e:
+        raise AutomationError(f"Clicking Download didn't produce a browser download: {e}")
+    return download_info.value
+
+
+_HTML_SIGNATURES = (b"<!doctype", b"<html")
+
+
+def download_studio_video(
+    video_id: str, dest_dir: str, *,
+    profile_root: str = None, profile_name: str = "Default",
+    browser_channel: str = "chrome", headless: bool = False,
+    progress_callback: ProgressCallback = None,
+):
+
+    def report(step, message):
+        if progress_callback:
+            progress_callback(step, message)
+
+    os.makedirs(dest_dir, exist_ok=True)
+
+    pw, context, profile_root = _open_automation_browser(
+        profile_root, profile_name, browser_channel, headless, report)
+
+    page = context.new_page()
+    edit_url = f"{STUDIO_URL}/video/{video_id}/edit"
+    report("navigate", f"Opening {edit_url} ...")
+    page.goto(edit_url, wait_until="load")
+    _inject_progress_bar(page)
+    _update_progress_bar(page, "PAE: locating download link...", pct=0)
+
+    download = _trigger_native_download(page, report)
+
+    dest_path = os.path.join(dest_dir, f"{video_id}.mp4")
+    report("download", "Downloading (can take a while for large videos)...")
+    _update_progress_bar(page, "PAE: downloading... please wait")
+    download.save_as(dest_path)
+
+    if not os.path.exists(dest_path) or os.path.getsize(dest_path) == 0:
+        raise AutomationError("Download finished but produced an empty file - try again.")
+    with open(dest_path, "rb") as f:
+        head = f.read(32).lstrip().lower()
+    if any(head.startswith(sig) for sig in _HTML_SIGNATURES):
+        raise AutomationError(
+            "The download produced an HTML page instead of a video file - YouTube "
+            "Studio's download flow may have changed. Download the video manually "
+            f"and place it at {dest_path}, or check youtube_automation/driver.py's "
+            "_trigger_native_download().")
+
+    report("download", f"Downloaded: {os.path.basename(dest_path)}")
+    _update_progress_bar(page, "PAE: download complete - removing silence...", pct=0)
+    return dest_path, pw, context, page
+
+
+def _apply_cuts_with_progress(page, cuts: list, duration: float, report: Callable,
+                              chunk_size: int = 10) -> str:
+    # Applies cuts in small batches purely so the progress bar has something real to
+    # report between batches - each batch is still one direct data-insertion call via
+    # _APPLY_CUTS_JS, not a UI simulation.
+    if not cuts:
+        msg = "No silence cuts to apply - silent_intervals is empty for this session."
+        report("cuts", msg)
+        _update_progress_bar(page, f"PAE: {msg}", pct=100)
+        return msg
+
+    ms_pairs = [(round(max(0.0, s) * 1000), round(min(duration, e) * 1000)) for s, e in cuts]
+    total = len(ms_pairs)
+    applied = 0
+    failed: list = []
+
+    _update_progress_bar(page, f"PAE: applying cuts... 0/{total}", pct=0)
+    for i in range(0, total, chunk_size):
+        chunk = ms_pairs[i:i + chunk_size]
+        try:
+            outcome = page.evaluate(_APPLY_CUTS_JS, chunk)
+        except Exception as ex:
+            msg = f"Failed to apply cuts - {ex}"
+            report("cuts", msg)
+            _update_progress_bar(page, f"PAE: {msg}")
+            return msg
+
+        if outcome.get("panelMissing"):
+            msg = ("Couldn't find the Trim & cut panel on this page - Studio's layout "
+                   "may have changed.")
+            report("cuts", msg)
+            _update_progress_bar(page, f"PAE: {msg}")
+            return msg
+
+        for j, r in enumerate(outcome["results"], start=i + 1):
+            if r.get("ok"):
+                applied += 1
+            else:
+                failed.append((j, r.get("error")))
+
+        done = i + len(chunk)
+        pct = int(done * 100 / total)
+        report("cuts", f"Applying cuts... {done}/{total}")
+        _update_progress_bar(page, f"PAE: applying cuts... {done}/{total} ({pct}%)", pct=pct)
+
+    if failed:
+        first_i, first_err = failed[0]
+        msg = (f"{applied}/{total} cuts applied - {len(failed)} failed "
+               f"(first at cut {first_i}: {first_err})")
+    else:
+        msg = f"{applied} cuts applied - review and Save"
+
+    _update_progress_bar(page, f"PAE: {msg}", pct=100)
+    report("cuts", msg)
+    return msg
+
+
+def finish_editing_existing_video(
+    page, video_id: str, cuts: list, duration: float, *,
+    progress_callback: ProgressCallback = None,
+) -> None:
+    def report(step, message):
+        if progress_callback:
+            progress_callback(step, message)
+
+    editor_url = f"{STUDIO_URL}/video/{video_id}/editor"
+    report("navigate", f"Opening the editor: {editor_url} ...")
+    page.goto(editor_url, wait_until="load")
+    _inject_progress_bar(page)
+    _update_progress_bar(page, "PAE: entering Trim & cut...", pct=0)
+
+    try:
+        page.locator('a:has-text("Trim & cut")').first.click(timeout=15000)
+        page.locator("#new-cut-button").wait_for(state="visible", timeout=15000)
+    except Exception as e:
+        raise AutomationError(
+            "Couldn't enter the Trim & cut editor - YouTube Studio's layout may have "
+            f"changed. Open Editor > Trim & cut yourself and apply the cuts manually. ({e})")
+
+    result = _apply_cuts_with_progress(page, cuts, duration, report)
+    _notify_done()
+    report("done", result)
 
 
 def close_all_sessions() -> None:

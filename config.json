@@ -182,6 +182,18 @@
       "min_cut_duration_s": 1.0,
       "max_merge_gap_s": 0.35
     },
+    "youtube_silent_only_profile": {
+      "name": "YouTube Silent Only",
+      "silence_removal": {
+        "mode": "only",
+        "min_silence_duration_s": 0.6,
+        "threshold_db": -35,
+        "padding_s": 0.12
+      }
+    },
+    "youtube_download": {
+      "download_directory": "./videos/youtube_downloads/"
+    },
     "transcript_windows": {
       "target_segment_length_s": 110
     },
