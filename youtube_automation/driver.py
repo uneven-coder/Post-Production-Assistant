@@ -330,6 +330,51 @@ _APPLY_CUTS_JS = """
 """
 
 
+_APPLY_CUTS_ASYNC_JS = """
+(async ([cuts, delayMs, total]) => {
+  const el = document.querySelector('ytve-trim-options-panel');
+  if (!el) return {panelMissing: true};
+  const label = document.getElementById('__pae_progress_label');
+  const fill = document.getElementById('__pae_progress_fill');
+
+  const hidden = [document.getElementById('timeline-section'),
+                  document.getElementById('panel-container')].filter(Boolean);
+  const prevDisplay = hidden.map((t) => t.style.display);
+  for (const t of hidden) t.style.display = 'none';
+  if (label) label.textContent = 'PAE: UI paused - applying ' + total + ' cut(s)...';
+
+  const results = [];
+  try {
+    for (let i = 0; i < cuts.length; i++) {
+      const [startMs, endMs] = cuts[i];
+      try {
+        el.addNewCutAtTime(startMs);
+        const idx = el.cuts.length - 1;
+        const cutId = el.cuts[idx].id;
+        el.set('cuts.' + idx + '.endMs', endMs);
+        el.approveCutById(cutId);
+        results.push({ok: true});
+      } catch (e) {
+        results.push({ok: false, error: String(e)});
+      }
+
+      const done = i + 1;
+      const pct = Math.round(done * 100 / total);
+      if (label) label.textContent = 'PAE: UI paused - applying cuts... ' + done + '/' + total + ' (' + pct + '%)';
+      if (fill) fill.style.width = pct + '%';
+
+      if (delayMs > 0) {
+        await new Promise((resolve) => setTimeout(resolve, delayMs));
+      }
+    }
+  } finally {
+    hidden.forEach((t, i) => { t.style.display = prevDisplay[i]; });
+  }
+  return {results};
+})
+"""
+
+
 def _safe_reinject(page, init_js: str) -> None:
     try:
         page.evaluate(init_js)
@@ -813,10 +858,14 @@ def download_studio_video(
 
 
 def _apply_cuts_with_progress(page, cuts: list, duration: float, report: Callable,
-                              chunk_size: int = 10) -> str:
-    # Applies cuts in small batches purely so the progress bar has something real to
-    # report between batches - each batch is still one direct data-insertion call via
-    # _APPLY_CUTS_JS, not a UI simulation.
+                              ui_delay_ms: int = 5) -> str:
+    # Applies every cut in one call to _APPLY_CUTS_ASYNC_JS, which hides the timeline
+    # and cut-row list for the duration (that's what actually causes the lag, not our
+    # own per-cut calls - see the JS constant's comment) and shows a "paused" message
+    # on the progress bar in their place, restoring both once done. Console-side
+    # progress is necessarily coarser than before (start and final result only) since
+    # the whole batch is now one blocking call rather than several chunked ones; the
+    # on-page bar still updates live, per cut, from inside that call.
     if not cuts:
         msg = "No silence cuts to apply - silent_intervals is empty for this session."
         report("cuts", msg)
@@ -825,42 +874,32 @@ def _apply_cuts_with_progress(page, cuts: list, duration: float, report: Callabl
 
     ms_pairs = [(round(max(0.0, s) * 1000), round(min(duration, e) * 1000)) for s, e in cuts]
     total = len(ms_pairs)
-    applied = 0
-    failed: list = []
 
-    _update_progress_bar(page, f"PAE: applying cuts... 0/{total}", pct=0)
-    for i in range(0, total, chunk_size):
-        chunk = ms_pairs[i:i + chunk_size]
-        try:
-            outcome = page.evaluate(_APPLY_CUTS_JS, chunk)
-        except Exception as ex:
-            msg = f"Failed to apply cuts - {ex}"
-            report("cuts", msg)
-            _update_progress_bar(page, f"PAE: {msg}")
-            return msg
+    report("cuts", f"Applying {total} cut(s) - UI paused for the duration...")
+    _update_progress_bar(page, f"PAE: UI paused - applying {total} cut(s)...", pct=0)
+    try:
+        outcome = page.evaluate(_APPLY_CUTS_ASYNC_JS, [ms_pairs, ui_delay_ms, total])
+    except Exception as ex:
+        msg = f"Failed to apply cuts - {ex}"
+        report("cuts", msg)
+        _update_progress_bar(page, f"PAE: {msg}")
+        return msg
 
-        if outcome.get("panelMissing"):
-            msg = ("Couldn't find the Trim & cut panel on this page - Studio's layout "
-                   "may have changed.")
-            report("cuts", msg)
-            _update_progress_bar(page, f"PAE: {msg}")
-            return msg
+    if outcome.get("panelMissing"):
+        msg = ("Couldn't find the Trim & cut panel on this page - Studio's layout "
+               "may have changed.")
+        report("cuts", msg)
+        _update_progress_bar(page, f"PAE: {msg}")
+        return msg
 
-        for j, r in enumerate(outcome["results"], start=i + 1):
-            if r.get("ok"):
-                applied += 1
-            else:
-                failed.append((j, r.get("error")))
-
-        done = i + len(chunk)
-        pct = int(done * 100 / total)
-        report("cuts", f"Applying cuts... {done}/{total}")
-        _update_progress_bar(page, f"PAE: applying cuts... {done}/{total} ({pct}%)", pct=pct)
+    results = outcome["results"]
+    failed = [(i, r) for i, r in enumerate(results, 1) if not r.get("ok")]
+    applied = len(results) - len(failed)
 
     if failed:
-        first_i, first_err = failed[0]
+        first_i, first = failed[0]
         msg = (f"{applied}/{total} cuts applied - {len(failed)} failed "
-               f"(first at cut {first_i}: {first_err})")
+               f"(first at cut {first_i}: {first.get('error')})")
     else:
         msg = f"{applied} cuts applied - review and Save"
 

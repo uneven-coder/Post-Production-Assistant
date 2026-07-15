@@ -186,9 +186,18 @@
       "name": "YouTube Silent Only",
       "silence_removal": {
         "mode": "only",
-        "min_silence_duration_s": 0.6,
-        "threshold_db": -35,
+        "min_silence_duration_s": 1.0,
+        "threshold_db": -40,
         "padding_s": 0.12
+      },
+      "youtube_automation": {
+        "enabled": true,
+        "auto_launch_on_silence_only": true,
+        "profile_root": "",
+        "profile_name": "Default",
+        "browser_channel": "chrome",
+        "min_cut_duration_s": 1.5,
+        "max_merge_gap_s": 0.75
       }
     },
     "youtube_download": {
