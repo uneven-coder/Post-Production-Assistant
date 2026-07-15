@@ -4,6 +4,7 @@ Desktop tool that takes multi-camera recordings, transcribes the audio, generate
 
 Made by Cratior - "This tool uses AI to improve video editing by automatically segmenting projects. Cost is approximately $0.06 for a 10-minute video, varying based on video length, model choice, and other factors."
 
+this has been made with help from ai, generating code, lots of documentation and stuff, but it has all been reviewed and tested, this project has grown in scope and complexity.
 ## Prerequisites
 
 - Python 3.11+

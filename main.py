@@ -3,8 +3,11 @@ import json
 import os
 import queue
 import shutil
+from datetime import datetime
 
 from config import get_config, resolve_paths, apply_profile
+
+RUN_MANIFEST_FILENAME = "pae_manifest.json"
 
 MSG_LOG         = "log"
 MSG_STAGE_START = "stage_start"
@@ -239,6 +242,75 @@ def run_youtube_automation(config: dict, silent_intervals: list, progress_callba
                    progress_callback=progress_callback, **kwargs)
 
 
+def output_root_from_template(template: str) -> str:
+    """Strip {placeholder} template parts to find the shared parent output folder."""
+    idx = template.find("{")
+    base = template[:idx] if idx != -1 else template
+    base = base.rstrip("/\\") or "."
+    return os.path.abspath(base)
+
+
+def save_run_manifest(config: dict, silent_intervals: list) -> str | None:
+    """Snapshot the resolved config + silence cuts into the run's output dir so
+    YouTube automation can be launched against this run later, in another session."""
+    output_dir = (config.get("project") or {}).get("output_directory", {}).get("file")
+    if not output_dir:
+        return None
+    manifest = {
+        "saved_at": datetime.now().isoformat(timespec="seconds"),
+        "config": {k: v for k, v in config.items() if k != "env"},
+        "silent_intervals": [list(iv) for iv in (silent_intervals or [])],
+    }
+    os.makedirs(output_dir, exist_ok=True)
+    path = os.path.join(output_dir, RUN_MANIFEST_FILENAME)
+    with open(path, "w", encoding="utf-8") as f:
+        json.dump(manifest, f, indent=2)
+    return path
+
+
+def load_run_manifest(manifest_path: str) -> tuple[dict, list]:
+    with open(manifest_path, "r", encoding="utf-8") as f:
+        manifest = json.load(f)
+    config = manifest.get("config") or {}
+    config["env"] = dict(os.environ)
+    silent_intervals = [tuple(iv) for iv in manifest.get("silent_intervals") or []]
+    return config, silent_intervals
+
+
+def find_past_runs(output_root: str) -> list[dict]:
+    """Scan output_root for completed runs with a saved manifest, newest first."""
+    results = []
+    if not output_root or not os.path.isdir(output_root):
+        return results
+    for name in os.listdir(output_root):
+        run_dir = os.path.join(output_root, name)
+        manifest_path = os.path.join(run_dir, RUN_MANIFEST_FILENAME)
+        if not os.path.isfile(manifest_path):
+            continue
+        try:
+            with open(manifest_path, "r", encoding="utf-8") as f:
+                manifest = json.load(f)
+        except (OSError, json.JSONDecodeError):
+            continue
+        project = (manifest.get("config") or {}).get("project") or {}
+        video_ok = any(
+            "audio_source" in (v.get("tags") or [])
+            and (v.get("path") or {}).get("file")
+            and os.path.exists(v["path"]["file"])
+            for v in project.get("videos", [])
+        )
+        results.append({
+            "dir": run_dir,
+            "manifest_path": manifest_path,
+            "project_name": project.get("name", name),
+            "saved_at": manifest.get("saved_at", ""),
+            "mtime": os.path.getmtime(manifest_path),
+            "video_ok": video_ok,
+        })
+    results.sort(key=lambda r: r["mtime"], reverse=True)
+    return results
+
+
 def _copy_inputs_to_output(config: dict) -> None:
     opts = (config.get("project") or {}).get("output_options") or {}
     if not opts.get("copy_inputs"):
@@ -378,6 +450,11 @@ class ProcessingWorker:
                 self._emit(MSG_STAGE_ERROR, ("tests", f"{fails} failure(s)"))
         except Exception as e:
             self._emit(MSG_STAGE_ERROR, ("tests", str(e)))
+
+        try:
+            save_run_manifest(config, silent_intervals)
+        except Exception as e:
+            self._emit(MSG_LOG, f"[warn] Could not save run manifest: {e}")
 
         self._emit(MSG_DONE, None)
 

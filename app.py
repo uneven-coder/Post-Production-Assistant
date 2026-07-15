@@ -283,7 +283,7 @@ class PAEApp(tk.Tk):
         self._youtube_btn = tk.Button(
             bar, text="📺 YouTube", command=self._on_youtube_automation_click,
             bg="#3c3c3c", fg="#d4d4d4", font=("Arial", 9, "bold"),
-            padx=10, pady=3, relief="flat", cursor="hand2", state="disabled")
+            padx=10, pady=3, relief="flat", cursor="hand2")
         self._youtube_btn.pack(side="left", padx=(2, 2))
 
         self._stop_btn = tk.Button(
@@ -982,33 +982,96 @@ class PAEApp(tk.Tk):
         except Exception:
             return False
 
-    def _on_youtube_automation_click(self):
-        config = self.state.last_resolved_config
-        if not config:
-            return
-        yt_cfg = (config.get("project") or {}).get("youtube_automation") or {}
-        if not yt_cfg.get("enabled"):
-            if not messagebox.askyesno(
-                "YouTube automation disabled",
-                "project.youtube_automation.enabled is false in this config.\n\n"
-                "Run it anyway for this session?"):
-                return
+    def _youtube_output_options(self):
+        # "Latest" is pinned first and greyed out until a run happens this session;
+        # everything else found on disk follows, newest first.
+        from datetime import datetime
+        from main import find_past_runs, output_root_from_template
 
-        silent_intervals = list(self.state.silent_intervals)
+        options = []
+        latest_config = self.state.last_resolved_config
+        latest_dir = None
+        if latest_config:
+            proj_name = (latest_config.get("project") or {}).get("name", "current run")
+            latest_dir = os.path.abspath(
+                (latest_config.get("project") or {}).get("output_directory", {}).get("file", ""))
+            options.append({
+                "key": "latest", "enabled": True,
+                "label": f"Latest (this session) — {proj_name}",
+            })
+        else:
+            options.append({
+                "key": "latest", "enabled": False,
+                "label": "Latest (this session) — no run yet",
+            })
+
+        raw_template = (self.state.config.get("project") or {}).get(
+            "output_directory", "./output/{project_name}_{date}_{time}")
+        if not isinstance(raw_template, str):
+            raw_template = "./output/"
+        output_root = output_root_from_template(raw_template)
+
+        for run in find_past_runs(output_root):
+            if os.path.abspath(run["dir"]) == latest_dir:
+                continue  # already represented by "Latest"
+            ts = run["saved_at"]
+            try:
+                ts = datetime.fromisoformat(run["saved_at"]).strftime("%Y-%m-%d %H:%M")
+            except (ValueError, TypeError):
+                pass
+            label = f"{ts} — {run['project_name']}"
+            if not run["video_ok"]:
+                label += "  (source video missing)"
+            options.append({
+                "key": run["manifest_path"], "enabled": run["video_ok"], "label": label,
+            })
+        return options
+
+    def _on_youtube_automation_click(self):
+        options = self._youtube_output_options()
 
         dlg = tk.Toplevel(self)
         dlg.title("YouTube Upload Automation")
         dlg.configure(bg="#1e1e1e")
-        dlg.geometry("520x360")
+        dlg.geometry("560x420")
+        dlg.minsize(480, 320)
+        dlg.resizable(True, True)
 
         tk.Label(dlg, text="Your actual Chrome window will open (same profile, cookies and "
                            "all - close other Chrome windows first if prompted). Watch or "
                            "take over any time; nothing is published automatically.",
-                bg="#1e1e1e", fg="#888899", font=("Arial", 9), wraplength=500,
+                bg="#1e1e1e", fg="#888899", font=("Arial", 9), wraplength=540,
                 justify="left").pack(fill="x", padx=10, pady=(10, 4))
 
+        sel_row = tk.Frame(dlg, bg="#1e1e1e")
+        sel_row.pack(fill="x", padx=10, pady=(2, 8))
+        tk.Label(sel_row, text="Output:", bg="#1e1e1e", fg="#888899",
+                 font=("Arial", 9)).pack(side="left", padx=(0, 6))
+
+        display_to_key = {}
+        display_values = []
+        default_display = None
+        for opt in options:
+            display = opt["label"] if opt["enabled"] else f"⊘ {opt['label']}"
+            display_values.append(display)
+            display_to_key[display] = opt["key"] if opt["enabled"] else None
+            if opt["enabled"] and default_display is None:
+                default_display = display
+
+        combo = ttk.Combobox(sel_row, values=display_values, state="readonly",
+                             width=46, font=("Arial", 9))
+        combo.pack(side="left", fill="x", expand=True)
+        if default_display:
+            combo.set(default_display)
+
+        # Reserve the button row at the bottom *before* packing the expanding log
+        # widget below - otherwise the log's default natural size claims the whole
+        # dialog and pushes Start/Close outside the visible window.
+        btn_row = tk.Frame(dlg, bg="#1e1e1e")
+        btn_row.pack(side="bottom", pady=(4, 10))
+
         log = scrolledtext.ScrolledText(
-            dlg, bg="#0d0d0d", fg="#d4d4d4", font=("Consolas", 9),
+            dlg, bg="#0d0d0d", fg="#d4d4d4", font=("Consolas", 9), height=10,
             relief="flat", borderwidth=0, state="disabled")
         log.pack(fill="both", expand=True, padx=10, pady=4)
 
@@ -1018,27 +1081,60 @@ class PAEApp(tk.Tk):
             log.see("end")
             log.config(state="disabled")
 
-        close_btn = tk.Button(dlg, text="Close", command=dlg.destroy,
+        def _start():
+            key = display_to_key.get(combo.get())
+            if not key:
+                messagebox.showinfo("Select an output", "Pick a valid output first.", parent=dlg)
+                return
+
+            if key == "latest":
+                config = self.state.last_resolved_config
+                silent_intervals = list(self.state.silent_intervals)
+            else:
+                from main import load_run_manifest
+                try:
+                    config, silent_intervals = load_run_manifest(key)
+                except Exception as e:
+                    messagebox.showerror("Load failed", str(e), parent=dlg)
+                    return
+
+            yt_cfg = (config.get("project") or {}).get("youtube_automation") or {}
+            if not yt_cfg.get("enabled"):
+                if not messagebox.askyesno(
+                    "YouTube automation disabled",
+                    "project.youtube_automation.enabled is false in this config.\n\n"
+                    "Run it anyway for this session?", parent=dlg):
+                    return
+
+            start_btn.config(state="disabled")
+            combo.config(state="disabled")
+            self._youtube_btn.config(state="disabled")
+
+            def _worker():
+                try:
+                    from main import run_youtube_automation
+
+                    def _on_progress(step, message):
+                        self._queue.put((_MSG_YT_PROGRESS, f"[{step}] {message}"))
+
+                    run_youtube_automation(config, silent_intervals, progress_callback=_on_progress)
+                    self._queue.put((_MSG_YT_DONE, None))
+                except Exception as e:
+                    self._queue.put((_MSG_YT_ERROR, str(e)))
+
+            self._yt_log_fn = _log
+            threading.Thread(target=_worker, daemon=True).start()
+
+        start_btn = tk.Button(btn_row, text="▶ Start", command=_start,
+                              bg="#0e639c", fg="white", font=("Arial", 9, "bold"),
+                              padx=14, pady=3, relief="flat", cursor="hand2",
+                              state="normal" if default_display else "disabled")
+        start_btn.pack(side="left", padx=4)
+
+        close_btn = tk.Button(btn_row, text="Close", command=dlg.destroy,
                               bg="#3c3c3c", fg="#d4d4d4", font=("Arial", 9),
                               padx=10, pady=3, relief="flat", cursor="hand2")
-        close_btn.pack(pady=(4, 10))
-
-        self._youtube_btn.config(state="disabled")
-
-        def _worker():
-            try:
-                from main import run_youtube_automation
-
-                def _on_progress(step, message):
-                    self._queue.put((_MSG_YT_PROGRESS, f"[{step}] {message}"))
-
-                run_youtube_automation(config, silent_intervals, progress_callback=_on_progress)
-                self._queue.put((_MSG_YT_DONE, None))
-            except Exception as e:
-                self._queue.put((_MSG_YT_ERROR, str(e)))
-
-        self._yt_log_fn = _log
-        threading.Thread(target=_worker, daemon=True).start()
+        close_btn.pack(side="left", padx=4)
 
     def _start_preview_playback(self, path: str):
         if not self._ensure_vlc():
