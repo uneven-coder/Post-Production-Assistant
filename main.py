@@ -56,20 +56,28 @@ def _find_audio_source(config: dict) -> str:
 
 
 def detect_silence_intervals(config: dict) -> list[tuple[float, float]]:
-    from silence.detector import silent_intervals
+    from silence.detector import silent_intervals, cap_intervals
 
     audio_file = _find_audio_source(config)
     silence_cfg = config.get("project", {}).get("silence_removal", {}) or {}
     threshold_db = silence_cfg.get("threshold_db", -35)
     min_duration_s = silence_cfg.get("min_silence_duration_s", 0.6)
     padding_s = silence_cfg.get("padding_s", 0.12)
+    max_edits = silence_cfg.get("max_edits", 60)
 
     print(f"Detecting silence in: {os.path.basename(audio_file)}")
     intervals = silent_intervals(audio_file, threshold_db, min_duration_s, padding_s)
     print(f"Found {len(intervals)} silent section(s)")
-    for s, e in intervals:
+
+    capped = cap_intervals(intervals, max_edits)
+    if len(capped) != len(intervals):
+        print(f"Capped to {len(capped)} edit(s) (silence_removal.max_edits={max_edits}) - "
+              f"spread across the timeline and prioritized by duration; this is the list "
+              f"the timeline, output, and YouTube automation all use.")
+
+    for s, e in capped:
         print(f"  [{s:.1f}s - {e:.1f}s] ({e - s:.1f}s)")
-    return intervals
+    return capped
 
 
 def _remap_chapters_to_original(chapters: list, keep_intervals: list[tuple[float, float]]) -> None:
@@ -218,6 +226,7 @@ def run_youtube_automation(config: dict, silent_intervals: list, progress_callba
     from youtube_automation.driver import reduce_cuts_for_studio, run_automation
 
     yt_cfg = (config.get("project") or {}).get("youtube_automation", {}) or {}
+    silence_cfg = (config.get("project") or {}).get("silence_removal", {}) or {}
     video_path = _find_audio_source(config)
     duration = _probe_duration(video_path)
 
@@ -232,7 +241,8 @@ def run_youtube_automation(config: dict, silent_intervals: list, progress_callba
     cuts = reduce_cuts_for_studio(
         silent_intervals or [],
         min_duration_s=yt_cfg.get("min_cut_duration_s", 1.0),
-        max_merge_gap_s=yt_cfg.get("max_merge_gap_s", 0.35))
+        max_merge_gap_s=yt_cfg.get("max_merge_gap_s", 0.35),
+        max_edits=silence_cfg.get("max_edits", 60))
     if progress_callback and len(cuts) != len(silent_intervals or []):
         progress_callback("cuts", f"Reduced {len(silent_intervals or [])} detected "
                                    f"silences to {len(cuts)} cuts for YouTube Studio "
@@ -620,9 +630,16 @@ def run_youtube_silent_only(config_path: str) -> None:
         return
 
     yt_cfg = config["project"].get("youtube_automation", {}) or {}
+    silence_cfg = config["project"].get("silence_removal", {}) or {}
     cuts = yt_driver.reduce_cuts_for_studio(
         silent_intervals, min_duration_s=yt_cfg.get("min_cut_duration_s", 1.0),
-        max_merge_gap_s=yt_cfg.get("max_merge_gap_s", 0.35))
+        max_merge_gap_s=yt_cfg.get("max_merge_gap_s", 0.35),
+        max_edits=silence_cfg.get("max_edits", 60))
+    if len(cuts) != len(silent_intervals or []):
+        print(f"Reduced {len(silent_intervals or [])} detected silences to {len(cuts)} "
+              f"cuts for YouTube Studio (merged close-together ones, dropped ones too "
+              f"short to bother with, capped to youtube_silent_only_profile.silence_removal"
+              f".max_edits={silence_cfg.get('max_edits', 60)}).")
     duration = _probe_duration(video_path)
 
     print(f"\n-> Opening the Trim & cut editor for {video_id} and applying "

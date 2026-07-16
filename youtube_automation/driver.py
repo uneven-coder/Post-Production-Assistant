@@ -23,9 +23,16 @@ class AutomationError(RuntimeError):
     pass
 
 
+class _ContextDead(Exception):
+    # Internal signal from _trigger_native_download to download_studio_video: the
+    # browser context itself closed (not just a page), so only relaunching the whole
+    # browser can recover - never surfaced to callers outside this module.
+    pass
+
+
 def reduce_cuts_for_studio(
     cuts: list[tuple[float, float]], min_duration_s: float = 1.0,
-    max_merge_gap_s: float = 0.35,
+    max_merge_gap_s: float = 0.35, max_edits: int = -1,
 ) -> list[tuple[float, float]]:
     if not cuts:
         return []
@@ -35,7 +42,10 @@ def reduce_cuts_for_studio(
             merged[-1][1] = max(merged[-1][1], e)
         else:
             merged.append([s, e])
-    return [(s, e) for s, e in merged if e - s >= min_duration_s]
+    result = [(s, e) for s, e in merged if e - s >= min_duration_s]
+
+    from silence.detector import cap_intervals
+    return cap_intervals(result, max_edits)
 
 
 def _find_chrome_exe_path() -> Optional[str]:
@@ -347,6 +357,15 @@ _APPLY_CUTS_JS = """
 # approveCutById() call on the last cut's id afterwards is what flips whatever flag
 # enables Save - confirmed via the same interception that neither dispatch() nor a
 # second, unobserved side effect of approveCutById() themselves account for it.
+#
+# Does NOT hide the timeline/cut-list during this anymore (an earlier version did, as
+# a leftover from when applying was a slow per-cut loop). With only one dispatch() +
+# one approveCutById() call there's nothing left to hide lag from, and hiding was
+# actively counterproductive: confirmed via screenshot that toggling display:none/''
+# around the call is what broke the timeline's own reactive redraw (dashed cut-marker
+# lines never appeared even after restoring visibility), while leaving the timeline
+# visible throughout renders them correctly and immediately, exactly like a real user
+# clicking "New Cut" through the UI does.
 _APPLY_ALL_CUTS_JS = """
 (cuts) => {
   const el = document.querySelector('ytve-trim-options-panel');
@@ -356,46 +375,32 @@ _APPLY_ALL_CUTS_JS = """
   const fill = document.getElementById('__pae_progress_fill');
   const total = cuts.length;
 
-  const hidden = [document.getElementById('timeline-section'),
-                  document.getElementById('panel-container')].filter(Boolean);
-  const prevDisplay = hidden.map((t) => t.style.display);
-  for (const t of hidden) t.style.display = 'none';
-  if (label) label.textContent = 'PAE: UI paused - applying ' + total + ' cut(s)...';
+  if (label) label.textContent = 'PAE: applying ' + total + ' cut(s)...';
 
   let results;
   try {
-    try {
-      const videoDur = el.videoDurationMs;
-      const markersMs = [0];
-      for (const [startMs, endMs] of cuts) { markersMs.push(startMs, endMs); }
-      markersMs.push(videoDur);
-      el.dispatch({type: 'EDITOR_ADD_NEW_CUT', payload: {markersMs, cutId: total}});
-      el.approveCutById(total);
-      results = cuts.map(() => ({ok: true}));
-    } catch (e) {
-      results = cuts.map(() => ({ok: false, error: String(e)}));
-    }
-
-    if (label) label.textContent = 'PAE: ' + total + ' cut(s) applied';
-    if (fill) fill.style.width = '100%';
-  } finally {
-    hidden.forEach((t, i) => { t.style.display = prevDisplay[i]; });
-    // Un-hiding alone doesn't reliably make Studio's own timeline/canvas repaint
-    // against the new cut list - nudge it with a resize event plus a forced reflow.
-    window.dispatchEvent(new Event('resize'));
-    void document.body.offsetHeight;
+    const videoDur = el.videoDurationMs;
+    const markersMs = [0];
+    for (const [startMs, endMs] of cuts) { markersMs.push(startMs, endMs); }
+    markersMs.push(videoDur);
+    el.dispatch({type: 'EDITOR_ADD_NEW_CUT', payload: {markersMs, cutId: total}});
+    el.approveCutById(total);
+    results = cuts.map(() => ({ok: true}));
+  } catch (e) {
+    results = cuts.map(() => ({ok: false, error: String(e)}));
   }
+
+  if (label) label.textContent = 'PAE: ' + total + ' cut(s) applied';
+  if (fill) fill.style.width = '100%';
   return {results};
 }
 """
 
 
 def _inject_cut_range_filter(page, total: int) -> None:
-    # Reviewing a few hundred cut-rows by scrolling is impractical, and toggling which
-    # rows are shown/hidden is also a cheap, direct way to force Studio's own
-    # timeline/canvas to recompute against the current DOM instead of relying on
-    # display:none/'' alone to trigger a proper repaint. Purely visual - only
-    # `.cut-row` elements get hidden, `el.cuts` (what Save actually reads) is untouched.
+    # Reviewing a few hundred cut-rows by scrolling is impractical. Purely visual -
+    # only individual `.cut-row` elements in the panel's row list get hidden/shown;
+    # `el.cuts` (what Save actually reads) and the timeline itself are untouched.
     js = """
 ([total]) => {
   const existing = document.getElementById('__pae_range_filter');
@@ -884,7 +889,7 @@ _DOWNLOAD_ATTEMPTS = 3
 _DOWNLOAD_START_TIMEOUT_MS = 120000  # per attempt - see retry comment below
 
 
-def _trigger_native_download(page, edit_url: str, report: Callable):
+def _trigger_native_download(page, context, edit_url: str, report: Callable):
     # Opens the video's "more actions" (⋮) menu and clicks its Download item -
     # studio.youtube.com renders that item as
     # <tp-yt-paper-item test-id="VIDEO_DOWNLOAD"><a href="...download_my_video?...">.
@@ -894,16 +899,39 @@ def _trigger_native_download(page, edit_url: str, report: Callable):
     #
     # Intermittently, the click doesn't trigger a download at all - instead the tab
     # navigates to Studio's generic channel content list
-    # (.../channel/<id>/videos/upload?filter=...&sort=...), observed but not fully
-    # root-caused. Plausibly the href's token is time-limited and occasionally goes
-    # stale between page load and click, or the click races with Studio's own SPA
-    # click handling on the menu item. Either way a fresh page load gets a fresh
-    # token/menu state, so on that specific failure mode this reloads and retries
-    # from scratch rather than giving up after one attempt.
+    # (.../channel/<id>/videos/upload?filter=...&sort=...), and Studio's own JS then
+    # appears to close that tab entirely a moment later (observed: a plain retry's
+    # page.goto() on the same `page` then fails with "Target page, context or browser
+    # has been closed"). Root cause not fully nailed down, but two contributing factors
+    # look likely and this guards against both: (1) the menu item can become "visible"
+    # before its href is actually populated with the real signed download URL, so
+    # clicking too early clicks a stale/empty link; (2) the href's token may itself be
+    # time-limited and occasionally goes stale between page load and click. Either way
+    # a fresh page load gets a fresh token/menu state, so on failure this reloads (onto
+    # a new page if the old one got closed) and retries from scratch.
+    page_ref = [page]  # mutable box so the caller can see a page swapped mid-retry
+
     for attempt in range(1, _DOWNLOAD_ATTEMPTS + 1):
+        page = page_ref[0]
         if attempt > 1:
             report("download", f"Retrying download (attempt {attempt}/{_DOWNLOAD_ATTEMPTS})...")
-            page.goto(edit_url, wait_until="load")
+            if page.is_closed():
+                report("download", "Previous attempt closed the tab - opening a new one.")
+                try:
+                    page = context.new_page()
+                    page.goto(edit_url, wait_until="load")
+                except Exception as e:
+                    # The whole context (not just the page) died - a persistent-context
+                    # profile can auto-close once its last page does. Even a freshly
+                    # created page's own .goto() can fail this way if that teardown was
+                    # already in flight. No page left to recover with here; only a
+                    # fresh browser launch can fix this, which is above this function's
+                    # scope - let the caller decide.
+                    raise _ContextDead(str(e)) from e
+                _inject_progress_bar(page)
+                page_ref[0] = page
+            else:
+                page.goto(edit_url, wait_until="load")
 
         report("download", "Opening the video's options menu...")
         menu_button = page.locator(_MENU_BUTTON_SELECTOR).first
@@ -926,14 +954,28 @@ def _trigger_native_download(page, edit_url: str, report: Callable):
                 "in the download directory, or check youtube_automation/driver.py's "
                 "_trigger_native_download() selectors.")
 
+        # The item can render before its href is actually populated with the real,
+        # signed download URL - wait for something that looks real rather than
+        # clicking the instant the element is merely visible.
+        href = ""
+        for _ in range(20):  # up to ~4s
+            href = item.get_attribute("href") or ""
+            if "download_my_video" in href:
+                break
+            page.wait_for_timeout(200)
+        if "download_my_video" not in href:
+            report("download", "Download link hasn't populated yet - clicking anyway.")
+
         report("download", "Starting download...")
         try:
             with page.expect_download(timeout=_DOWNLOAD_START_TIMEOUT_MS) as download_info:
                 item.click(timeout=10000)
-            return download_info.value
+            return download_info.value, page
         except Exception as e:
-            wrong_page = "/video/" not in page.url
-            if wrong_page:
+            if page.is_closed():
+                report("download", f"Click closed the tab instead of downloading "
+                                    f"(attempt {attempt}/{_DOWNLOAD_ATTEMPTS}).")
+            elif "/video/" not in page.url:
                 report("download", f"Click navigated to {page.url} instead of downloading "
                                     f"(attempt {attempt}/{_DOWNLOAD_ATTEMPTS}).")
             last_error = e
@@ -944,6 +986,9 @@ def _trigger_native_download(page, edit_url: str, report: Callable):
 
 
 _HTML_SIGNATURES = (b"<!doctype", b"<html")
+
+
+_BROWSER_SESSION_ATTEMPTS = 2
 
 
 def download_studio_video(
@@ -958,18 +1003,48 @@ def download_studio_video(
             progress_callback(step, message)
 
     os.makedirs(dest_dir, exist_ok=True)
-
-    pw, context, profile_root = _open_automation_browser(
-        profile_root, profile_name, browser_channel, headless, report)
-
-    page = context.new_page()
     edit_url = f"{STUDIO_URL}/video/{video_id}/edit"
-    report("navigate", f"Opening {edit_url} ...")
-    page.goto(edit_url, wait_until="load")
-    _inject_progress_bar(page)
-    _update_progress_bar(page, "PAE: locating download link...", pct=0)
 
-    download = _trigger_native_download(page, edit_url, report)
+    # A persistent-context profile can close its whole browser process once its last
+    # page closes, not just that page - _trigger_native_download signals this with
+    # _ContextDead since no page left in a dead context can recover on its own. When
+    # that happens, relaunch the whole browser (fresh context, fresh profile lock) and
+    # retry from scratch rather than failing outright.
+    for session_attempt in range(1, _BROWSER_SESSION_ATTEMPTS + 1):
+        pw, context, profile_root = _open_automation_browser(
+            profile_root, profile_name, browser_channel, headless, report)
+
+        page = context.new_page()
+        report("navigate", f"Opening {edit_url} ...")
+        page.goto(edit_url, wait_until="load")
+        _inject_progress_bar(page)
+        _update_progress_bar(page, "PAE: locating download link...", pct=0)
+
+        try:
+            download, page = _trigger_native_download(page, context, edit_url, report)
+            break
+        except _ContextDead:
+            try:
+                _ACTIVE_SESSIONS.remove((pw, context))
+            except ValueError:
+                pass
+            try:
+                context.close()
+            except Exception:
+                pass
+            try:
+                pw.stop()
+            except Exception:
+                pass
+            if session_attempt == _BROWSER_SESSION_ATTEMPTS:
+                raise AutomationError(
+                    "The browser kept closing itself while trying to download this "
+                    "video - this may be YouTube Studio blocking repeated automated "
+                    "download attempts rather than a one-off glitch. Try again later, "
+                    "or download the video manually and place it in the download "
+                    "directory.")
+            report("download", f"The browser session itself closed - relaunching "
+                                f"(session {session_attempt + 1}/{_BROWSER_SESSION_ATTEMPTS})...")
 
     dest_path = os.path.join(dest_dir, f"{video_id}.mp4")
     report("download", "Downloading (can take a while for large videos)...")
@@ -1006,8 +1081,8 @@ def _apply_cuts_with_progress(page, cuts: list, duration: float, report: Callabl
     ms_pairs = [(round(max(0.0, s) * 1000), round(min(duration, e) * 1000)) for s, e in cuts]
     total = len(ms_pairs)
 
-    report("cuts", f"Applying {total} cut(s) - UI paused for the duration...")
-    _update_progress_bar(page, f"PAE: UI paused - applying {total} cut(s)...", pct=0)
+    report("cuts", f"Applying {total} cut(s)...")
+    _update_progress_bar(page, f"PAE: applying {total} cut(s)...", pct=0)
     try:
         outcome = page.evaluate(_APPLY_ALL_CUTS_JS, ms_pairs)
     except Exception as ex:

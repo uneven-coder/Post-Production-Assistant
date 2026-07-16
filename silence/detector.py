@@ -73,6 +73,62 @@ def silent_intervals(
     return [(iv.start, iv.end) for iv in intervals.intervals if iv.is_silent and iv.end > iv.start]
 
 
+def cap_intervals(
+    intervals: list[tuple[float, float]], max_count: int,
+) -> list[tuple[float, float]]:
+    # Long/noisy sources can produce far more silence cuts than is practical to apply
+    # anywhere downstream (YouTube Studio's editor bogs down past a few hundred manual
+    # edits; a Premiere timeline with hundreds of hatched-out silence clips is unusable
+    # to scrub). max_count caps that - shared by every consumer of silence intervals
+    # (transcript trimming, the Premiere/FCPXML timeline, previews, and YouTube Studio
+    # automation) so they all agree on the same filtered cut list rather than each
+    # independently deciding which silences "count".
+    #
+    # A plain top-N-by-duration cut would cluster wherever silence happens to run
+    # longest (e.g. one rambly intro), leaving the rest of the video untouched. A
+    # plain evenly-spaced sample would waste edits on tiny/unimportant gaps just to
+    # keep spacing uniform. This splits the timeline into max_count buckets (spread
+    # across the full duration) and keeps each bucket's single longest interval - so
+    # edits track wherever the source actually has silence worth trimming, not raw
+    # chronological order. Buckets with no interval in them free up their slot for
+    # whichever remaining intervals (from other buckets) are individually longest, so
+    # the cap still prioritizes the most worthwhile edits instead of leaving slots
+    # unused.
+    if max_count < 0 or len(intervals) <= max_count:
+        return list(intervals)
+    if max_count == 0:
+        return []
+
+    ordered = sorted(intervals)
+    start = ordered[0][0]
+    span = ordered[-1][1] - start
+    if span <= 0:
+        return sorted(sorted(ordered, key=lambda iv: iv[1] - iv[0], reverse=True)[:max_count])
+
+    bucket_width = span / max_count
+    buckets: list[list[tuple[float, float]]] = [[] for _ in range(max_count)]
+    for s, e in ordered:
+        idx = int(((s + e) / 2 - start) / bucket_width)
+        idx = max(0, min(max_count - 1, idx))
+        buckets[idx].append((s, e))
+
+    selected: list[tuple[float, float]] = []
+    leftover: list[tuple[float, float]] = []
+    for bucket in buckets:
+        if not bucket:
+            continue
+        bucket.sort(key=lambda iv: iv[1] - iv[0], reverse=True)
+        selected.append(bucket[0])
+        leftover.extend(bucket[1:])
+
+    deficit = max_count - len(selected)
+    if deficit > 0 and leftover:
+        leftover.sort(key=lambda iv: iv[1] - iv[0], reverse=True)
+        selected.extend(leftover[:deficit])
+
+    return sorted(selected)
+
+
 def invert_intervals(
     silence: list[tuple[float, float]], total_duration: float,
 ) -> list[tuple[float, float]]:

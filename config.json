@@ -141,7 +141,8 @@
       "mode": "mark",
       "min_silence_duration_s": 0.6,
       "threshold_db": -35,
-      "padding_s": 0.12
+      "padding_s": 0.12,
+      "max_edits": 30
     },
     "silence_only_profile": {
       "name": "Silence Only",
@@ -170,7 +171,8 @@
         "mode": "only",
         "min_silence_duration_s": 0.6,
         "threshold_db": -35,
-        "padding_s": 0.12
+        "padding_s": 0.12,
+        "max_edits": 30
       }
     },
     "youtube_automation": {
@@ -188,7 +190,8 @@
         "mode": "only",
         "min_silence_duration_s": 1.0,
         "threshold_db": -40,
-        "padding_s": 0.12
+        "padding_s": 0.12,
+        "max_edits": 30
       },
       "youtube_automation": {
         "enabled": true,
