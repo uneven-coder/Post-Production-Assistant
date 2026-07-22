@@ -55,7 +55,10 @@ def _find_audio_source(config: dict) -> str:
     return audio_file
 
 
-def detect_silence_intervals(config: dict) -> list[tuple[float, float]]:
+def detect_silence_intervals(config: dict, cap: bool = True) -> list[tuple[float, float]]:
+    # cap=False returns the full detected list, used when transcript-assisted
+    # refinement runs afterwards, so the cap applies to the *refined* list
+    # instead of throwing away intervals the refiner might have kept.
     from silence.detector import silent_intervals, cap_intervals
 
     audio_file = _find_audio_source(config)
@@ -69,6 +72,24 @@ def detect_silence_intervals(config: dict) -> list[tuple[float, float]]:
     intervals = silent_intervals(audio_file, threshold_db, min_duration_s, padding_s)
     print(f"Found {len(intervals)} silent section(s)")
 
+    # Optional second pass with a more lenient volume threshold, but only
+    # keeping LONG stretches catches "nothing happening" sections (background
+    # noise, quiet music, idle time) that sit above the strict dB threshold
+    long_cfg = silence_cfg.get("long_pause") or {}
+    if long_cfg.get("enabled"):
+        from silence.refiner import merge_ranges
+        loose_db = long_cfg.get("loose_threshold_db", threshold_db + 10)
+        loose_min_s = long_cfg.get("loose_min_duration_s", 5.0)
+        loose = silent_intervals(audio_file, loose_db, loose_min_s, padding_s)
+        loose = [(s, e) for s, e in loose if e - s >= loose_min_s]
+        if loose:
+            print(f"Loose pass ({loose_db}dB, >={loose_min_s}s): "
+                  f"{len(loose)} long low-activity section(s)")
+            intervals = merge_ranges(intervals + loose)
+
+    if not cap:
+        return intervals
+
     capped = cap_intervals(intervals, max_edits)
     if len(capped) != len(intervals):
         print(f"Capped to {len(capped)} edit(s) (silence_removal.max_edits={max_edits}) - "
@@ -78,6 +99,65 @@ def detect_silence_intervals(config: dict) -> list[tuple[float, float]]:
     for s, e in capped:
         print(f"  [{s:.1f}s - {e:.1f}s] ({e - s:.1f}s)")
     return capped
+
+
+def refine_silence_with_transcript(config: dict, raw_silence: list,
+                                   timing: dict = None, chapters: list = None) -> list:
+    """Refine audio-detected silences with Whisper timing + chapter classifications,
+    then apply the max_edits cap. See silence/refiner.py for the mechanics."""
+    from silence.detector import _probe_duration, cap_intervals
+    from silence.refiner import chapter_removal_ranges, refine_silences
+
+    silence_cfg = (config.get("project") or {}).get("silence_removal", {}) or {}
+    t_cfg = silence_cfg.get("transcript") or {}
+    long_cfg = silence_cfg.get("long_pause") or {}
+
+    extra = chapter_removal_ranges(
+        chapters or [],
+        t_cfg.get("remove_segment_types") or [],
+        min_confidence=t_cfg.get("min_confidence", 0.7))
+    if extra:
+        print(f"Chapter classification marked {len(extra)} removable range(s) "
+              f"(types: {', '.join(t_cfg.get('remove_segment_types') or [])}).")
+
+    total_duration = None
+    try:
+        total_duration = _probe_duration(_find_audio_source(config)) or None
+    except RuntimeError:
+        pass
+
+    refined = refine_silences(
+        raw_silence, timing or {}, extra,
+        speech_pad_s=t_cfg.get("speech_pad_s", 0.08),
+        min_silence_duration_s=silence_cfg.get("min_silence_duration_s", 0.6),
+        no_speech_prob_threshold=t_cfg.get("no_speech_prob_threshold", 0.85),
+        add_no_speech_segments=bool(t_cfg.get("add_no_speech_segments", True)),
+        long_gap_min_s=(long_cfg.get("min_speech_gap_s", 4.0)
+                        if long_cfg.get("enabled") else 0.0),
+        long_gap_edge_pad_s=long_cfg.get("edge_pad_s", 0.5),
+        total_duration_s=total_duration)
+
+    return cap_intervals(refined, silence_cfg.get("max_edits", 60))
+
+
+def estimate_pipeline_cost(config: dict, silent_intervals: list = None) -> dict | None:
+    """Predict the run's API spend before any AI call is made."""
+    from ai.pricing import estimate_run_cost
+    from silence.detector import _probe_duration
+
+    try:
+        audio_file = _find_audio_source(config)
+    except RuntimeError:
+        return None
+    duration = _probe_duration(audio_file)
+    if duration <= 0:
+        return None
+
+    billable = duration
+    mode = (config.get("project") or {}).get("silence_removal", {}).get("mode", "off")
+    if mode == "mark" and silent_intervals:
+        billable = max(0.0, duration - sum(e - s for s, e in silent_intervals))
+    return estimate_run_cost(config, duration, billable)
 
 
 def _remap_chapters_to_original(chapters: list, keep_intervals: list[tuple[float, float]]) -> None:
@@ -91,7 +171,14 @@ def _remap_chapters_to_original(chapters: list, keep_intervals: list[tuple[float
             seg["end_time"] = _map(seg["end_time"], keep_intervals)
 
 
-def process_transcript(config: dict, silent_intervals: list = None) -> list:
+def process_transcript(config: dict, silent_intervals: list = None) -> tuple[list, dict, dict]:
+    """Transcribe the audio source and generate chapters.
+
+    Returns (chapters, timing, costs): timing is Whisper's
+    {'segments': [...], 'words': [...]} in the transcribed file's timebase
+    (the original file when silent_intervals is None); costs holds the ACTUAL
+    per-step API spend ({'transcription': {...}, 'chapters': {...},
+    'total_usd': x}) for the manifest."""
     from ai import client as ai
     from ai.response import ResponseInfo
     from chapters.segmenter import segment_transcript, TranscriptSegmenter
@@ -121,7 +208,7 @@ def process_transcript(config: dict, silent_intervals: list = None) -> list:
 
     try:
         print(f"Transcribing: {os.path.basename(transcribe_path)}")
-        transcript_text, transcript_info = ai.transcribe(
+        transcript_text, transcript_timing, transcript_info = ai.transcribe(
             transcribe_path,
             model=t_cfg["name"],
             prompt=t_cfg.get("prompts", ""),
@@ -136,22 +223,43 @@ def process_transcript(config: dict, silent_intervals: list = None) -> list:
 
         print(f"Transcription complete ({len(transcript_text)} chars)\n")
         print(transcript_info.format())
+
+        if keep_intervals and transcript_timing:
+            # Timing came back in the trimmed audio's timebase, then remap to the source
+            from silence.detector import map_trimmed_to_original as _map_t
+            for entry in (transcript_timing.get("segments") or []) + (transcript_timing.get("words") or []):
+                entry["start"] = _map_t(entry["start"], keep_intervals)
+                entry["end"] = _map_t(entry["end"], keep_intervals)
+
+        _save_file(output_dir, "transcript.txt", transcript_text)
+        if transcript_timing and (transcript_timing.get("segments") or transcript_timing.get("words")):
+            _save_file(output_dir, "transcript_timing.json", json.dumps(transcript_timing, indent=2))
         print("\nGenerating chapters...")
 
+        has_timing = bool(transcript_timing and transcript_timing.get("segments"))
         chapter_result = segment_transcript(
-            transcript_text, transcribe_path, config=config, return_cost=True)
+            transcript_text, transcribe_path, config=config, return_cost=True,
+            timing=transcript_timing if has_timing else None)
 
         if isinstance(chapter_result, tuple):
             chapters, chapter_info = chapter_result
         else:
             chapters, chapter_info = chapter_result, ResponseInfo()
 
+        costs = {
+            "transcription": transcript_info.to_dict(),
+            "chapters": chapter_info.to_dict(),
+            "total_usd": round(transcript_info.total_cost + chapter_info.total_cost, 6),
+        }
+
         if not chapters:
             print("Warning: No chapters generated")
-            _save_file(output_dir, "transcript.txt", transcript_text)
-            return []
+            return [], transcript_timing, costs
 
-        if keep_intervals:
+        if keep_intervals and not has_timing:
+            # Char-estimated chapter times are in the trimmed timebase; Whisper
+            # timing was already remapped to the original above, so chapters
+            # built from it need no second remap.
             _remap_chapters_to_original(chapters, keep_intervals)
 
         print(f"Generated {len(chapters)} chapters:")
@@ -171,7 +279,7 @@ def process_transcript(config: dict, silent_intervals: list = None) -> list:
         chapters_json = segmenter.export_chapters(chapters, format="json")
         chapters_file = _save_file(output_dir, "chapters.json", chapters_json)
         print(f"\nChapters saved: {chapters_file}")
-        return chapters
+        return chapters, transcript_timing, costs
     finally:
         if trimmed_path and os.path.exists(trimmed_path):
             try:
@@ -253,6 +361,106 @@ def run_youtube_automation(config: dict, silent_intervals: list, progress_callba
                    progress_callback=progress_callback, **kwargs)
 
 
+def build_run_summary(config: dict, silent_intervals: list,
+                      chapters: list = None, cost_estimate: dict = None,
+                      stage_times: dict = None, test_results: dict = None,
+                      run_duration_s: float = None) -> dict:
+    """Stats for one run: how much silence came out, chapters, predicted cost,
+    per-stage timing, test results, and total wall-clock time.
+    Returned as a dict (stored in the manifest); format_run_summary renders it."""
+    from silence.detector import _probe_duration
+
+    duration = 0.0
+    source = ""
+    try:
+        source = _find_audio_source(config)
+        duration = _probe_duration(source)
+    except RuntimeError:
+        pass
+
+    cuts = sorted(silent_intervals or [])
+    removed_s = sum(e - s for s, e in cuts)
+    longest = max((e - s for s, e in cuts), default=0.0)
+
+    summary = {
+        "source": os.path.basename(source) if source else "",
+        "duration_s": round(duration, 2),
+        "cuts": len(cuts),
+        "silence_removed_s": round(removed_s, 2),
+        "silence_removed_pct": round(removed_s / duration * 100, 1) if duration else 0.0,
+        "longest_cut_s": round(longest, 2),
+        "result_duration_s": round(max(0.0, duration - removed_s), 2),
+        "chapters": len(chapters or []),
+    }
+    if cost_estimate:
+        summary["estimated_cost_usd"] = round(cost_estimate.get("total", 0.0), 4)
+    if stage_times:
+        summary["stage_times"] = stage_times
+    if test_results:
+        summary["test_results"] = test_results
+    if run_duration_s is not None:
+        summary["run_duration_s"] = round(run_duration_s, 2)
+    return summary
+
+
+def format_run_summary(summary: dict) -> list[str]:
+    def _hms(t):
+        m, s = divmod(int(t), 60)
+        h, m = divmod(m, 60)
+        return f"{h}:{m:02d}:{s:02d}" if h else f"{m}:{s:02d}"
+
+    lines = ["=== Run Summary ==="]
+    if summary.get("source"):
+        lines.append(f"Source: {summary['source']} ({_hms(summary.get('duration_s', 0))})")
+    lines.append(f"Silence removed: {_hms(summary.get('silence_removed_s', 0))} "
+                 f"({summary.get('silence_removed_pct', 0)}% of the video) "
+                 f"across {summary.get('cuts', 0)} cut(s)")
+    if summary.get("cuts"):
+        lines.append(f"Longest cut: {summary.get('longest_cut_s', 0):.1f}s")
+    lines.append(f"Length after cuts: {_hms(summary.get('result_duration_s', 0))}")
+    if summary.get("chapters"):
+        lines.append(f"Chapters generated: {summary['chapters']}")
+    if "estimated_cost_usd" in summary:
+        lines.append(f"Estimated API cost: ${summary['estimated_cost_usd']:.4f}")
+    if "actual_cost_usd" in summary:
+        lines.append(f"Actual API cost: ${summary['actual_cost_usd']:.4f}")
+
+    stage_times = summary.get("stage_times") or {}
+    if stage_times:
+        order = ["silence", "borders", "transcript", "chapters", "timeline", "tests"]
+        parts = []
+        for sid in order:
+            rec = stage_times.get(sid)
+            if not rec:
+                continue
+            if rec.get("status") == "skipped":
+                parts.append(f"{sid}: skipped")
+            elif rec.get("duration_s") is not None:
+                parts.append(f"{sid}: {rec['duration_s']:.1f}s"
+                            + (" (failed)" if rec.get("status") == "error" else ""))
+        if parts:
+            lines.append("Stage times: " + ", ".join(parts))
+
+    test_results = summary.get("test_results")
+    if test_results:
+        ran = test_results.get("ran", 0)
+        failures = test_results.get("failures", 0)
+        errors = test_results.get("errors", 0)
+        if test_results.get("crashed"):
+            lines.append(f"Tests: could not run ({test_results.get('error', 'unknown error')})")
+        elif failures or errors:
+            lines.append(f"Tests: {ran - failures - errors}/{ran} passed "
+                         f"({failures} failure(s), {errors} error(s))")
+            for name in test_results.get("failed_names", [])[:10]:
+                lines.append(f"  FAILED: {name}")
+        else:
+            lines.append(f"Tests: {ran}/{ran} passed")
+
+    if "run_duration_s" in summary:
+        lines.append(f"Total processing time: {_hms(summary['run_duration_s'])}")
+    return lines
+
+
 def output_root_from_template(template: str) -> str:
     """Strip {placeholder} template parts to find the shared parent output folder."""
     idx = template.find("{")
@@ -261,7 +469,9 @@ def output_root_from_template(template: str) -> str:
     return os.path.abspath(base)
 
 
-def save_run_manifest(config: dict, silent_intervals: list) -> str | None:
+def save_run_manifest(config: dict, silent_intervals: list,
+                      cost_estimate: dict = None, summary: dict = None,
+                      extra: dict = None) -> str | None:
     """Snapshot the resolved config + silence cuts into the run's output dir so
     YouTube automation can be launched against this run later, in another session."""
     output_dir = (config.get("project") or {}).get("output_directory", {}).get("file")
@@ -272,6 +482,15 @@ def save_run_manifest(config: dict, silent_intervals: list) -> str | None:
         "config": {k: v for k, v in config.items() if k != "env"},
         "silent_intervals": [list(iv) for iv in (silent_intervals or [])],
     }
+    if cost_estimate:
+        # Kept so predicted-vs-actual can be compared across runs and the
+        # estimator heuristics tuned.
+        manifest["cost_estimate"] = cost_estimate
+    if summary:
+        manifest["summary"] = summary
+    for k, v in (extra or {}).items():
+        if v is not None:
+            manifest[k] = v
     os.makedirs(output_dir, exist_ok=True)
     path = os.path.join(output_dir, RUN_MANIFEST_FILENAME)
     with open(path, "w", encoding="utf-8") as f:
@@ -377,22 +596,54 @@ class ProcessingWorker:
     def __init__(self, q: "queue.Queue", config: dict):
         self._q = q
         self._config = config
+        # Per-stage wall-clock records built as stage events pass through _emit,
+        # persisted to the run manifest so past runs keep their full history.
+        self._stage_times: dict = {}
 
     def _emit(self, kind, data=None):
+        import time as _time
+        now = datetime.now().isoformat(timespec="seconds")
+        if kind == MSG_STAGE_START and isinstance(data, str):
+            self._stage_times[data] = {"status": "running", "started_at": now,
+                                       "_t0": _time.monotonic()}
+        elif kind in (MSG_STAGE_DONE, MSG_STAGE_SKIP, MSG_STAGE_ERROR):
+            stage_id = data[0] if isinstance(data, tuple) else data
+            if isinstance(stage_id, str):
+                rec = self._stage_times.setdefault(stage_id, {"started_at": now})
+                t0 = rec.pop("_t0", None)
+                if t0 is not None:
+                    rec["duration_s"] = round(_time.monotonic() - t0, 2)
+                rec["status"] = {MSG_STAGE_DONE: "done", MSG_STAGE_SKIP: "skipped",
+                                 MSG_STAGE_ERROR: "error"}[kind]
+                if kind == MSG_STAGE_ERROR and isinstance(data, tuple):
+                    rec["error"] = str(data[1])
         self._q.put((kind, data))
 
+    def stage_times(self) -> dict:
+        return {k: {kk: vv for kk, vv in v.items() if not kk.startswith("_")}
+                for k, v in self._stage_times.items()}
+
     def run(self):
+        import time as _time
+        run_started_at = datetime.now().isoformat(timespec="seconds")
+        run_t0 = _time.monotonic()
         config = self._config
         silence_cfg = (config.get("project") or {}).get("silence_removal") or {}
         mode = silence_cfg.get("mode", "off")
+        # Transcript-assisted refinement transcribes the FULL audio (so Whisper
+        # sees everything the dB detector wants to cut), refines the silence
+        # list against speech timestamps, and only then caps it.
+        use_transcript = bool(silence_cfg.get("use_transcript")) and mode in ("mark", "only")
 
         silent_intervals: list = []
         if mode in ("mark", "only"):
             self._emit(MSG_STAGE_START, "silence")
             try:
-                silent_intervals = detect_silence_intervals(config)
-                self._emit(MSG_SILENCE, silent_intervals)
-                self._emit(MSG_STAGE_DONE, "silence")
+                silent_intervals = detect_silence_intervals(config, cap=not use_transcript)
+                if not use_transcript:
+                    self._emit(MSG_SILENCE, silent_intervals)
+                    self._emit(MSG_STAGE_DONE, "silence")
+                # else: the silence stage stays running until refinement below
             except Exception as e:
                 self._emit(MSG_STAGE_ERROR, ("silence", str(e)))
                 self._emit(MSG_ERROR, f"Silence detection failed: {e}")
@@ -404,11 +655,26 @@ class ProcessingWorker:
 
         border_images = None
         chapters = None
+        transcript_timing = None
+        cost_estimate = None
+        actual_costs = None
+        run_transcript = (mode != "only") or use_transcript
+
+        if run_transcript:
+            # Predict spend before the first AI call so the user sees it up front.
+            # With use_transcript the full audio is billed (no pre-trim).
+            try:
+                from ai.pricing import format_estimate
+                cost_estimate = estimate_pipeline_cost(
+                    config, None if use_transcript else silent_intervals)
+                if cost_estimate:
+                    self._emit(MSG_COST, {"estimate": cost_estimate})
+                    self._emit(MSG_LOG, format_estimate(cost_estimate))
+            except Exception as e:
+                self._emit(MSG_LOG, f"[warn] Cost estimation failed: {e}")
 
         if mode == "only":
             self._emit(MSG_STAGE_SKIP, "borders")
-            self._emit(MSG_STAGE_SKIP, "transcript")
-            self._emit(MSG_STAGE_SKIP, "chapters")
         else:
             try:
                 self._emit(MSG_STAGE_START, "borders")
@@ -420,22 +686,50 @@ class ProcessingWorker:
                 self._emit(MSG_ERROR, f"Border processing failed: {e}")
                 return
 
+        if not run_transcript:
+            self._emit(MSG_STAGE_SKIP, "transcript")
+            self._emit(MSG_STAGE_SKIP, "chapters")
+        else:
             try:
                 self._emit(MSG_STAGE_START, "transcript")
-                chapters = process_transcript(
-                    config, silent_intervals=silent_intervals if mode == "mark" else None)
+                # Pre-trim only when the transcript isn't needed for refinement
+                pre_trim = silent_intervals if (mode == "mark" and not use_transcript) else None
+                chapters, transcript_timing, actual_costs = process_transcript(
+                    config, silent_intervals=pre_trim)
                 self._emit(MSG_STAGE_DONE, "transcript")
             except Exception as e:
                 self._emit(MSG_STAGE_ERROR, ("transcript", str(e)))
-                self._emit(MSG_ERROR, f"Transcript failed: {e}")
-                return
+                if use_transcript and mode == "only":
+                    # Refinement was a bonus here — fall back to audio-only cuts
+                    self._emit(MSG_LOG, f"[warn] Transcript failed ({e}) - using "
+                                        f"audio-only silence detection.")
+                else:
+                    self._emit(MSG_ERROR, f"Transcript failed: {e}")
+                    return
 
             if chapters:
                 self._emit(MSG_STAGE_START, "chapters")
                 self._emit(MSG_CHAPTERS, chapters)
                 self._emit(MSG_STAGE_DONE, "chapters")
-            else:
+            elif mode != "only":
                 self._emit(MSG_STAGE_ERROR, ("chapters", "none generated"))
+
+        if use_transcript:
+            try:
+                before = len(silent_intervals)
+                silent_intervals = refine_silence_with_transcript(
+                    config, silent_intervals, transcript_timing, chapters)
+                self._emit(MSG_LOG, f"Transcript refinement: {before} detected "
+                                    f"silence(s) -> {len(silent_intervals)} cut(s) "
+                                    f"after speech rescue/merging.")
+            except Exception as e:
+                from silence.detector import cap_intervals
+                silent_intervals = cap_intervals(
+                    silent_intervals, silence_cfg.get("max_edits", 60))
+                self._emit(MSG_LOG, f"[warn] Transcript refinement failed ({e}) - "
+                                    f"using audio-only silence detection.")
+            self._emit(MSG_SILENCE, silent_intervals)
+            self._emit(MSG_STAGE_DONE, "silence")
 
         try:
             self._emit(MSG_STAGE_START, "timeline")
@@ -449,21 +743,59 @@ class ProcessingWorker:
 
         _move_inputs(config)
 
+        test_results = None
         try:
             self._emit(MSG_STAGE_START, "tests")
             import unittest
             suite = unittest.TestLoader().discover("tests")
             result = unittest.TextTestRunner(verbosity=0, stream=open(os.devnull, "w")).run(suite)
+            test_results = {
+                "ran": result.testsRun,
+                "failures": len(result.failures),
+                "errors": len(result.errors),
+                "failed_names": [str(t) for t, _ in (result.failures + result.errors)],
+            }
             if result.wasSuccessful():
                 self._emit(MSG_STAGE_DONE, "tests")
             else:
                 fails = len(result.failures) + len(result.errors)
                 self._emit(MSG_STAGE_ERROR, ("tests", f"{fails} failure(s)"))
         except Exception as e:
+            test_results = {"crashed": True, "error": str(e)}
             self._emit(MSG_STAGE_ERROR, ("tests", str(e)))
 
+        # Built last so it can include the tests stage and the true total run time.
+        run_summary = None
         try:
-            save_run_manifest(config, silent_intervals)
+            run_summary = build_run_summary(
+                config, silent_intervals, chapters, cost_estimate,
+                stage_times=self.stage_times(), test_results=test_results,
+                run_duration_s=_time.monotonic() - run_t0)
+            if actual_costs:
+                run_summary["actual_cost_usd"] = actual_costs.get("total_usd", 0.0)
+            for line in format_run_summary(run_summary):
+                self._emit(MSG_LOG, line)
+            output_dir = (config.get("project") or {}).get("output_directory", {}).get("file")
+            if output_dir:
+                _save_file(output_dir, "run_summary.txt",
+                           "\n".join(format_run_summary(run_summary)) + "\n")
+        except Exception as e:
+            self._emit(MSG_LOG, f"[warn] Could not build run summary: {e}")
+
+        try:
+            chapter_dicts = None
+            if chapters:
+                from chapters.segmenter import TranscriptSegmenter
+                chapter_dicts = json.loads(
+                    TranscriptSegmenter(config).export_chapters(chapters))
+            save_run_manifest(config, silent_intervals, cost_estimate, run_summary,
+                              extra={
+                                  "chapters": chapter_dicts,
+                                  "costs": actual_costs,
+                                  "stage_times": self.stage_times(),
+                                  "run_started_at": run_started_at,
+                                  "run_duration_s": round(_time.monotonic() - run_t0, 2),
+                              })
         except Exception as e:
             self._emit(MSG_LOG, f"[warn] Could not save run manifest: {e}")
 
@@ -494,11 +826,13 @@ def run_headless(config_path: str, force_silence_only: bool = False) -> None:
         raw_config = json.load(f)
 
     if force_silence_only:
-        raw_config = apply_profile(raw_config, "silence_only")
-        raw_config.setdefault("project", {}).setdefault("silence_removal", {})["mode"] = "only"
+        derived = apply_profile(raw_config, "silence_only")
+        derived.setdefault("project", {}).setdefault("silence_removal", {})["mode"] = "only"
+    else:
+        derived = apply_profile(raw_config, "main")
 
     print(f"Using config: {config_path}")
-    config = resolve_paths(raw_config)
+    config = resolve_paths(derived)
     _assign_asset_ids(config)
 
     q: "queue.Queue" = queue.Queue()
@@ -567,11 +901,12 @@ def run_youtube_silent_only(config_path: str) -> None:
     with open(config_path, "r", encoding="utf-8") as f:
         raw_config = json.load(f)
 
-    if not (raw_config.get("project") or {}).get("youtube_silent_only_profile"):
-        print("[FAIL] config.json has no project.youtube_silent_only_profile block - see README.")
+    from config import has_profile
+    if not has_profile(raw_config, "youtube_automation"):
+        print("[FAIL] config.json has no project.youtube_automation_profile block - see README.")
         return
 
-    derived = apply_profile(raw_config, "youtube_silent_only")
+    derived = apply_profile(raw_config, "youtube_automation")
     derived.setdefault("project", {}).setdefault("silence_removal", {})["mode"] = "only"
 
     dl_cfg = derived.get("project", {}).get("youtube_download", {}) or {}
@@ -638,7 +973,7 @@ def run_youtube_silent_only(config_path: str) -> None:
     if len(cuts) != len(silent_intervals or []):
         print(f"Reduced {len(silent_intervals or [])} detected silences to {len(cuts)} "
               f"cuts for YouTube Studio (merged close-together ones, dropped ones too "
-              f"short to bother with, capped to youtube_silent_only_profile.silence_removal"
+              f"short to bother with, capped to youtube_automation_profile.silence_removal"
               f".max_edits={silence_cfg.get('max_edits', 60)}).")
     duration = _probe_duration(video_path)
 

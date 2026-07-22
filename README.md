@@ -41,11 +41,23 @@ The pipeline runs: silence detection (if enabled) → border processing → tran
 
 ## Configuration
 
-All settings live in `config.json`. Key fields:
+All settings live in `config.json`, under `project`, split into **profiles**:
+
+```json
+"project": {
+  "main_profile": { /* every setting below - the base configuration */ },
+  "silence_only_profile": { /* shallow-merged over main_profile for --silence-only */ },
+  "youtube_automation_profile": { /* shallow-merged over main_profile for --youtube-silent-only */ }
+}
+```
+
+`main_profile` holds the full base configuration and is what a normal **Run** uses. The other two profiles are small override blocks - any key you set in them replaces the same key from `main_profile` (shallow merge, one level deep) when that shortcut runs; everything else is inherited unchanged. This is also how the Config tab, headless CLI, and `remove_silence.bat` / `youtube_silent_only.bat` all resolve settings, so editing `main_profile` changes every entry point at once.
+
+The field table below lists paths relative to `main_profile` (i.e. `name` means `project.main_profile.name`) unless noted otherwise:
 
 | Field | Description |
 |---|---|
-| `project.name` | Project name, used in the output folder name |
+| `name` | Project name, used in the output folder name |
 | `output_directory` | Path template. Supports `{project_name}`, `{time}`, and `{date}` |
 | `output_options.move_inputs` | Move source videos into the output folder when `true` |
 | `output_options.date_format` | `strftime` format for `{date}`, default `%Y-%m-%d` |
@@ -59,9 +71,24 @@ All settings live in `config.json`. Key fields:
 | `silence_removal.min_silence_duration_s` | Minimum length of a quiet stretch to count as silence (default `0.6`) |
 | `silence_removal.threshold_db` | Volume below which audio is considered silent (default `-35`) |
 | `silence_removal.padding_s` | Seconds trimmed off each edge of a detected silence window so speech isn't clipped (default `0.12`) |
-| `silence_only_profile` | Optional override block applied on top of `project` for `--silence-only` / **⚡ Silence Only** - see [Silence removal](#silence-removal) |
-| `youtube_silent_only_profile` | Optional override block for `--youtube-silent-only` - see [YouTube Silent-Only Shortcut](#youtube-silent-only-shortcut) |
+| `silence_removal.use_transcript` | When `true` (and mode is `mark`/`only`), the full audio is transcribed first and the transcript refines the silence cuts: quiet speech below the dB threshold is rescued, cut edges snap to word boundaries, and Whisper-flagged non-speech stretches become extra cut candidates. Transcribes the full (untrimmed) audio, so Whisper cost is higher than the pre-trimmed `mark` flow |
+| `silence_removal.transcript.remove_segment_types` | Chapter-classification types (e.g. `["irrelevant"]`) whose windows are added to the cut list — requires `use_transcript` |
+| `silence_removal.transcript.min_confidence` | Minimum classification confidence for a window to be cut (default `0.7`) |
+| `silence_removal.transcript.speech_pad_s` | Padding around each transcribed word protected from cutting (default `0.08`) |
+| `silence_removal.transcript.no_speech_prob_threshold` | Whisper `no_speech_prob` above which a segment counts as non-speech (default `0.85`) |
+| `silence_removal.transcript.add_no_speech_segments` | Also cut loud-but-content-free stretches Whisper marks as non-speech (default `true`) |
+| `silence_removal.long_pause.enabled` | Catch larger "nothing happening" sections: adds a loose second detection pass and (with `use_transcript`) cuts long no-speech gaps regardless of loudness (default `true` in the main profile) |
+| `silence_removal.long_pause.min_speech_gap_s` | Stretches with no transcribed speech longer than this become cuts, even over music/background noise — requires `use_transcript` (default `4.0`) |
+| `silence_removal.long_pause.edge_pad_s` | Breathing room left at each edge of a removed speech gap (default `0.5`) |
+| `silence_removal.long_pause.loose_threshold_db` | Second detection pass threshold — more lenient than `threshold_db`, so quiet-but-not-silent audio qualifies (default `-25`) |
+| `silence_removal.long_pause.loose_min_duration_s` | Only stretches at least this long are kept from the loose pass, so normal speech pauses aren't touched (default `5.0`) |
+| `transcript_windows.target_segment_length_s` | Transcript window size for classification — smaller windows mean finer-grained chapters (default `60`) |
+| `chapters.merging.max_chapter_duration_s` | Force a chapter split past this length (default `300`) |
+| `chapters.merging.min_chapter_duration_s` | Chapters shorter than this are folded into a neighbor (default `45`) |
+| `chapters.merging.split_on_topic_change` | Split same-type chapters when the classified topic shifts (default `true`) |
 | `youtube_download.download_directory` | Where `--youtube-silent-only` saves the downloaded video, default `./videos/youtube_downloads/` |
+| *(sibling of `main_profile`)* `silence_only_profile` | Optional override block shallow-merged over `main_profile` for `--silence-only` / **⚡ Silence Only** - see [Silence removal](#silence-removal) |
+| *(sibling of `main_profile`)* `youtube_automation_profile` | Optional override block for `--youtube-silent-only` - see [YouTube Silent-Only Shortcut](#youtube-silent-only-shortcut) |
 
 ### Output folder naming
 
@@ -94,7 +121,7 @@ Produces `./output/My_Project_2025-06-25/` - one folder per run.
 
 ## Silence Removal
 
-Set `project.silence_removal.mode` in the config file to one of the following:
+Set `project.main_profile.silence_removal.mode` in the config file to one of the following:
 
 * **`off`** (default) - No silence detection. The pipeline behaves exactly as before.
 * **`mark`** - Detects silence on the audio-source video, transcribes a silence-trimmed copy of the audio (resulting in a cleaner and cheaper transcript), then remaps the generated chapters back onto the original timeline. This runs alongside the normal pipeline (borders, transcript generation, and AI chapters).
@@ -108,12 +135,15 @@ Silence detection uses the [`unsilence`](https://pypi.org/project/unsilence/) li
 
 ### Silence-Only Shortcut
 
-`project.silence_only_profile` in `config.json` acts as an override block for quickly cleaning up recordings without modifying your main configuration. Any keys defined within it are shallow-merged over `project` (typically a single video with borders disabled and `silence_removal.mode` set to `"only"`).
+`project.silence_only_profile` in `config.json` acts as an override block for quickly cleaning up recordings without modifying your main configuration. Any keys defined within it are shallow-merged over `project.main_profile` (typically a single video with borders disabled and `silence_removal.mode` set to `"only"`).
 
 ```json
-"silence_only_profile": {
-  "videos": [ /* single video, audio_source + main, border disabled */ ],
-  "silence_removal": { "mode": "only" }
+"project": {
+  "main_profile": { /* ... */ },
+  "silence_only_profile": {
+    "videos": [ /* single video, audio_source + main, border disabled */ ],
+    "silence_removal": { "mode": "only" }
+  }
 }
 ```
 
@@ -123,7 +153,7 @@ Run it using:
 python main.py --silence-only
 ```
 
-Alternatively, you can double-click `remove_silence.bat` or click **Silence Only** in the UI toolbar. All three methods apply `silence_only_profile` on top of `config.json` and force `silence_removal.mode` to `"only"` without changing what is saved to disk or displayed in the Config tab.
+Alternatively, you can double-click `remove_silence.bat` or click **Silence Only** in the UI toolbar. All three methods apply `silence_only_profile` on top of `main_profile` and force `silence_removal.mode` to `"only"` without changing what is saved to disk or displayed in the Config tab.
 
 ### YouTube Silent-Only Shortcut
 
@@ -136,15 +166,17 @@ It then, in order:
 
 1. Reads the video ID from the clipboard.
 2. Downloads the original file via YouTube Studio's own **⋮ → Download** action into `youtube_download.download_directory` (default `./videos/youtube_downloads/`).
-3. Runs the silence-only pipeline on that download, applying `project.youtube_silent_only_profile` (a `silence_removal.mode: "only"` override, same shallow-merge behavior as `silence_only_profile`).
+3. Runs the silence-only pipeline on that download, applying `project.youtube_automation_profile` (a `silence_removal.mode: "only"` override, same shallow-merge behavior over `main_profile` as `silence_only_profile`).
 4. Opens that same video's **Editor → Trim & cut** panel and shows a live progress bar directly on the page (download %, then pipeline stage). Once cuts are known, it applies every one of them automatically - no button, no click - then plays a notification sound when done. Because the video is already uploaded, there's no re-upload step.
 
 ```json
-"youtube_silent_only_profile": {
-  "silence_removal": { "mode": "only" }
-},
-"youtube_download": {
-  "download_directory": "./videos/youtube_downloads/"
+"project": {
+  "main_profile": {
+    "youtube_download": { "download_directory": "./videos/youtube_downloads/" }
+  },
+  "youtube_automation_profile": {
+    "silence_removal": { "mode": "only" }
+  }
 }
 ```
 

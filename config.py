@@ -49,13 +49,24 @@ def path_field(path: str, regex: Optional[str] = None) -> Dict[str, Any]:
     return result
 
 
-def apply_profile(config: dict, profile_name: str) -> dict:
+def apply_profile(config: dict, profile_name: str = "main") -> dict:
+    """Flatten `project.main_profile` into `project`, then shallow-merge the
+    named profile (e.g. `silence_only`, `youtube_automation`) on top of it."""
     cfg = copy.deepcopy(config)
-    project = cfg.setdefault("project", {})
-    profile = project.pop(f"{profile_name}_profile", None)
-    if profile:
-        project.update(profile)
+    project = cfg.get("project", {}) or {}
+
+    base = dict(project.get("main_profile") or {})
+    if profile_name != "main":
+        override = project.get(f"{profile_name}_profile") or {}
+        base.update(override)
+
+    cfg["project"] = base
     return cfg
+
+
+def has_profile(config: dict, profile_name: str) -> bool:
+    project = config.get("project", {}) or {}
+    return bool(project.get(f"{profile_name}_profile"))
 
 
 def resolve_paths(config: dict) -> dict:
@@ -86,4 +97,4 @@ def get_config() -> dict:
     config_path = os.path.join(os.path.dirname(__file__), "config.json")
     with open(config_path, "r", encoding="utf-8") as f:
         config = json.load(f)
-    return resolve_paths(config)
+    return resolve_paths(apply_profile(config, "main"))

@@ -1,148 +1,196 @@
 {
   "project": {
-    "name": "My Project",
-    "fps": 30,
-    "frame_width": 1920,
-    "frame_height": 1080,
-    "output_directory": "./output/{project_name}_{date}_{time}",
-    "output_options": {
-      "copy_inputs": true,
-      "move_inputs": false,
-      "date_format": "%Y-%m-%d",
-      "time_format": "%H%M%S"
-    },
-    "videos": [
-      {
-        "path": {
-          "path": "./videos/",
-          "regex": "24-min.*\\.mp4"
+    "main_profile": {
+      "name": "My Project",
+      "fps": 30,
+      "frame_width": 1920,
+      "frame_height": 1080,
+      "output_directory": "./output/{project_name}_{date}_{time}",
+      "output_options": {
+        "copy_inputs": true,
+        "move_inputs": false,
+        "date_format": "%Y-%m-%d",
+        "time_format": "%H%M%S"
+      },
+      "videos": [
+        {
+          "path": {
+            "path": "./videos/",
+            "regex": "24-min.*\\.mp4"
+          },
+          "tags": [
+            "audio_source",
+            "main"
+          ],
+          "overlay": {
+            "x": 0.0,
+            "y": 0.0,
+            "width": 1.0,
+            "height": 1.0,
+            "border": {
+              "enabled": false
+            }
+          }
         },
-        "tags": [
-          "audio_source",
-          "main"
-        ],
-        "overlay": {
-          "x": 0.0,
-          "y": 0.0,
-          "width": 1.0,
-          "height": 1.0,
-          "border": {
-            "enabled": false
+        {
+          "path": {
+            "path": "./videos/",
+            "regex": "webcam.*\\.mp4"
+          },
+          "tags": [
+            "overlay"
+          ],
+          "overlay": {
+            "x": 2,
+            "y": 1.8,
+            "width": 0.2,
+            "height": 0.2,
+            "border": {
+              "enabled": true,
+              "nine_patch_path": {
+                "path": "./assets/overlay_9patch.png"
+              },
+              "title": "Cam",
+              "inset_px": 8,
+              "scale": 0.65,
+              "background_color": [
+                0,
+                0,
+                0
+              ],
+              "font_path": "./assets/FuturaHeavy.otf",
+              "font_size": 84
+            }
+          }
+        },
+        {
+          "path": {
+            "path": "./videos/",
+            "regex": "chat.*\\.mp4"
+          },
+          "tags": [
+            "overlay"
+          ],
+          "overlay": {
+            "x": -2,
+            "y": 1.8,
+            "width": 0.1,
+            "height": 0.1,
+            "border": {
+              "enabled": true,
+              "nine_patch_path": {
+                "path": "./assets/overlay_9patch.png"
+              },
+              "title": "Chat",
+              "inset_px": 8,
+              "scale": 0.45,
+              "background_color": [
+                0,
+                0,
+                0
+              ],
+              "font_path": "./assets/FuturaHeavy.otf",
+              "font_size": 64
+            }
+          }
+        }
+      ],
+      "models": {
+        "transcript_model": {
+          "name": "whisper-1",
+          "prompts": "Describe the session and its main content.",
+          "api_key_env": "OPENAI_API_KEY",
+          "speed": 1
+        },
+        "chapter_title_model": {
+          "name": "gpt-4.1",
+          "prompts": "You are a helpful assistant that creates concise, descriptive chapter titles based on transcript content. Generate titles that are 3-8 words long and capture the main topic or theme.",
+          "api_key_env": "OPENAI_API_KEY",
+          "custom_settings": {
+            "temperature": 0.3,
+            "max_tokens": 2000
+          }
+        },
+        "semantic_segmentation_model": {
+          "name": "gpt-4.1-nano",
+          "prompts": "You are an expert at analyzing transcript content and identifying distinct topics, themes, and natural breakpoints.",
+          "api_key_env": "OPENAI_API_KEY",
+          "custom_settings": {
+            "temperature": 0.2,
+            "max_tokens": 8000
           }
         }
       },
-      {
-        "path": {
-          "path": "./videos/",
-          "regex": "webcam.*\\.mp4"
+      "semantic_analysis": {
+        "prompts": {
+          "segment_classification": "Analyze the following transcript segments and classify each by type.\n\n{segments_text}\n\nFor each segment, respond with a JSON object containing:\n- \"segment_classifications\": array of objects with:\n  - \"segment_index\": the segment number (1-based)\n  - \"type\": one of 'working', 'testing', 'explanation', 'problem_solving', 'irrelevant', 'setup', 'review', 'other'\n  - \"confidence\": score from 0.0 to 1.0\n  - \"summary\": brief description of what's happening\n  - \"topic\": a short 2-5 word label for the specific topic being worked on or discussed. IMPORTANT: while the topic has not changed from the previous segment, repeat the previous segment's topic string EXACTLY, character for character; only write a new topic string when the subject genuinely shifts.\n\nClassification guidelines:\n- 'working': Active coding, development, or creation\n- 'testing': Running tests, debugging, checking functionality\n- 'explanation': Teaching, explaining concepts or code\n- 'problem_solving': Troubleshooting, fixing bugs\n- 'irrelevant': Off-topic, jokes, unrelated content\n- 'setup': Environment setup, configuration\n- 'review': Code review, looking at existing code\n- 'other': Doesn't fit other categories\n\nRespond with valid JSON only."
+        }
+      },
+      "segment_colors": {
+        "working": "green",
+        "testing": "blue",
+        "explanation": "yellow",
+        "problem_solving": "orange",
+        "irrelevant": "red",
+        "setup": "purple",
+        "review": "cyan",
+        "silence": "gray",
+        "other": "gray",
+        "default": "white"
+      },
+      "silence_removal": {
+        "mode": "mark",
+        "min_silence_duration_s": 0.6,
+        "threshold_db": -35,
+        "padding_s": 0.12,
+        "max_edits": 800,
+        "use_transcript": true,
+        "transcript": {
+          "remove_segment_types": [
+            "irrelevant"
+          ],
+          "min_confidence": 0.7,
+          "speech_pad_s": 0.08,
+          "no_speech_prob_threshold": 0.85,
+          "add_no_speech_segments": true
         },
-        "tags": [
-          "overlay"
-        ],
-        "overlay": {
-          "x": 2,
-          "y": 1.8,
-          "width": 0.2,
-          "height": 0.2,
-          "border": {
-            "enabled": true,
-            "nine_patch_path": {
-              "path": "./assets/overlay_9patch.png"
-            },
-            "title": "Cam",
-            "inset_px": 8,
-            "scale": 0.65,
-            "background_color": [
-              0,
-              0,
-              0
-            ],
-            "font_path": "./assets/FuturaHeavy.otf",
-            "font_size": 84
-          }
+        "long_pause": {
+          "enabled": true,
+          "min_speech_gap_s": 4.0,
+          "edge_pad_s": 0.5,
+          "loose_threshold_db": -25,
+          "loose_min_duration_s": 5.0
         }
       },
-      {
-        "path": {
-          "path": "./videos/",
-          "regex": "chat.*\\.mp4"
+      "youtube_automation": {
+        "enabled": true,
+        "auto_launch_on_silence_only": true,
+        "profile_root": "",
+        "profile_name": "Default",
+        "browser_channel": "chrome",
+        "min_cut_duration_s": 1.0,
+        "max_merge_gap_s": 0.35
+      },
+      "youtube_download": {
+        "download_directory": "./videos/youtube_downloads/"
+      },
+      "transcript_windows": {
+        "target_segment_length_s": 60
+      },
+      "chapters": {
+        "merging": {
+          "max_chapter_duration_s": 300,
+          "min_chapter_duration_s": 45,
+          "split_on_topic_change": true
         },
-        "tags": [
-          "overlay"
-        ],
-        "overlay": {
-          "x": -2,
-          "y": 1.8,
-          "width": 0.1,
-          "height": 0.1,
-          "border": {
-            "enabled": true,
-            "nine_patch_path": {
-              "path": "./assets/overlay_9patch.png"
-            },
-            "title": "Chat",
-            "inset_px": 8,
-            "scale": 0.45,
-            "background_color": [
-              0,
-              0,
-              0
-            ],
-            "font_path": "./assets/FuturaHeavy.otf",
-            "font_size": 64
-          }
-        }
-      }
-    ],
-    "models": {
-      "transcript_model": {
-        "name": "whisper-1",
-        "prompts": "Describe the session and its main content.",
-        "api_key_env": "OPENAI_API_KEY",
-        "speed": 1
-      },
-      "chapter_title_model": {
-        "name": "gpt-4.1",
-        "prompts": "You are a helpful assistant that creates concise, descriptive chapter titles based on transcript content. Generate titles that are 3-8 words long and capture the main topic or theme.",
-        "api_key_env": "OPENAI_API_KEY",
-        "custom_settings": {
-          "temperature": 0.3,
-          "max_tokens": 2000
+        "titles": {
+          "include_index": true,
+          "template": "{chapter_index}. {chapter_title}"
         }
       },
-      "semantic_segmentation_model": {
-        "name": "gpt-4.1-nano",
-        "prompts": "You are an expert at analyzing transcript content and identifying distinct topics, themes, and natural breakpoints.",
-        "api_key_env": "OPENAI_API_KEY",
-        "custom_settings": {
-          "temperature": 0.2,
-          "max_tokens": 8000
-        }
+      "performance": {
+        "max_workers": 8
       }
-    },
-    "semantic_analysis": {
-      "prompts": {
-        "segment_classification": "Analyze the following transcript segments and classify each by type.\n\n{segments_text}\n\nFor each segment, respond with a JSON object containing:\n- \"segment_classifications\": array of objects with:\n  - \"segment_index\": the segment number (1-based)\n  - \"type\": one of 'working', 'testing', 'explanation', 'problem_solving', 'irrelevant', 'setup', 'review', 'other'\n  - \"confidence\": score from 0.0 to 1.0\n  - \"summary\": brief description of what's happening\n\nClassification guidelines:\n- 'working': Active coding, development, or creation\n- 'testing': Running tests, debugging, checking functionality\n- 'explanation': Teaching, explaining concepts or code\n- 'problem_solving': Troubleshooting, fixing bugs\n- 'irrelevant': Off-topic, jokes, unrelated content\n- 'setup': Environment setup, configuration\n- 'review': Code review, looking at existing code\n- 'other': Doesn't fit other categories\n\nRespond with valid JSON only."
-      }
-    },
-    "segment_colors": {
-      "working": "green",
-      "testing": "blue",
-      "explanation": "yellow",
-      "problem_solving": "orange",
-      "irrelevant": "red",
-      "setup": "purple",
-      "review": "cyan",
-      "silence": "gray",
-      "other": "gray",
-      "default": "white"
-    },
-    "silence_removal": {
-      "mode": "mark",
-      "min_silence_duration_s": 0.6,
-      "threshold_db": -35,
-      "padding_s": 0.12,
-      "max_edits": 30
     },
     "silence_only_profile": {
       "name": "Silence Only",
@@ -175,23 +223,31 @@
         "max_edits": 30
       }
     },
-    "youtube_automation": {
-      "enabled": true,
-      "auto_launch_on_silence_only": true,
-      "profile_root": "",
-      "profile_name": "Default",
-      "browser_channel": "chrome",
-      "min_cut_duration_s": 1.0,
-      "max_merge_gap_s": 0.35
-    },
-    "youtube_silent_only_profile": {
+    "youtube_automation_profile": {
       "name": "YouTube Silent Only",
       "silence_removal": {
         "mode": "only",
         "min_silence_duration_s": 1.0,
         "threshold_db": -40,
         "padding_s": 0.12,
-        "max_edits": 30
+        "max_edits": 180,
+        "use_transcript": true,
+        "transcript": {
+          "remove_segment_types": [
+            "irrelevant"
+          ],
+          "min_confidence": 0.7,
+          "speech_pad_s": 0.08,
+          "no_speech_prob_threshold": 0.85,
+          "add_no_speech_segments": true
+        },
+        "long_pause": {
+          "enabled": true,
+          "min_speech_gap_s": 4.0,
+          "edge_pad_s": 0.5,
+          "loose_threshold_db": -25,
+          "loose_min_duration_s": 5.0
+        }
       },
       "youtube_automation": {
         "enabled": true,
@@ -202,24 +258,6 @@
         "min_cut_duration_s": 1.5,
         "max_merge_gap_s": 0.75
       }
-    },
-    "youtube_download": {
-      "download_directory": "./videos/youtube_downloads/"
-    },
-    "transcript_windows": {
-      "target_segment_length_s": 110
-    },
-    "chapters": {
-      "merging": {
-        "max_chapter_duration_s": 600
-      },
-      "titles": {
-        "include_index": true,
-        "template": "{chapter_index}. {chapter_title}"
-      }
-    },
-    "performance": {
-      "max_workers": 8
     }
   }
 }

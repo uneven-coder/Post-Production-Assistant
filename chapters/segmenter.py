@@ -156,6 +156,7 @@ class TranscriptSegmenter:
                     "type": item.get("type") or "other",
                     "confidence": float(item.get("confidence") or 0.5),
                     "summary": item.get("summary") or "",
+                    "topic": (item.get("topic") or "").strip().lower(),
                 }
         return out, info
 
@@ -166,9 +167,14 @@ class TranscriptSegmenter:
         if not groups:
             return []
 
-        max_dur = self._cfg("chapters", "merging", "max_chapter_duration_s", default=600)
+        max_dur = self._cfg("chapters", "merging", "max_chapter_duration_s", default=300)
         if not isinstance(max_dur, (int, float)) or max_dur <= 0:
-            max_dur = 600
+            max_dur = 300
+        min_dur = self._cfg("chapters", "merging", "min_chapter_duration_s", default=0)
+        if not isinstance(min_dur, (int, float)) or min_dur < 0:
+            min_dur = 0
+        split_on_topic = bool(self._cfg("chapters", "merging", "split_on_topic_change",
+                                        default=True))
 
         proto: List[Dict] = []
 
@@ -181,25 +187,66 @@ class TranscriptSegmenter:
                 "end": max(cur_groups[-1][-1].end_time, cur_groups[0][0].start_time + 1.0),
             })
 
+        def _topic(i):
+            return (classification_map.get(i) or {}).get("topic", "")
+
         cur_type = (classification_map.get(0) or {}).get("type", "other")
+        cur_topic = _topic(0)
         cur_groups = [groups[0]]
         cur_indices = [0]
 
         for i in range(1, len(groups)):
             g_type = (classification_map.get(i) or {}).get("type", "other")
+            g_topic = _topic(i)
             g_end = max(groups[i][-1].end_time, groups[i][0].start_time + 1.0)
             cur_dur = g_end - cur_groups[0][0].start_time
+            cur_len = groups[i][0].start_time - cur_groups[0][0].start_time
 
-            if g_type == cur_type and cur_dur <= max_dur:
+            topic_changed = (split_on_topic and g_topic and cur_topic
+                             and g_topic != cur_topic and cur_len >= min_dur)
+
+            if g_type == cur_type and cur_dur <= max_dur and not topic_changed:
                 cur_groups.append(groups[i])
                 cur_indices.append(i)
+                if g_topic:
+                    cur_topic = g_topic
             else:
                 _flush(cur_type, cur_groups, cur_indices)
                 cur_type = g_type
+                cur_topic = g_topic
                 cur_groups = [groups[i]]
                 cur_indices = [i]
 
         _flush(cur_type, cur_groups, cur_indices)
+
+        # Fold sub-minimum chapters into the previous one (or the next, for the first)
+        if min_dur > 0:
+            folded: List[Dict] = []
+            for pc in proto:
+                if folded and (pc["end"] - pc["start"]) < min_dur:
+                    prev = folded[-1]
+                    prev["groups"].extend(pc["groups"])
+                    prev["group_indices"].extend(pc["group_indices"])
+                    prev["end"] = max(prev["end"], pc["end"])
+                elif not folded and len(proto) > 1 and (pc["end"] - pc["start"]) < min_dur:
+                    # Too-short opener: mark for merging into the next chapter
+                    folded.append(pc)
+                    pc["_fold_forward"] = True
+                else:
+                    if folded and folded[-1].pop("_fold_forward", False):
+                        short = folded.pop()
+                        pc = {
+                            "type": pc["type"],
+                            "groups": short["groups"] + pc["groups"],
+                            "group_indices": short["group_indices"] + pc["group_indices"],
+                            "start": short["start"],
+                            "end": pc["end"],
+                        }
+                    folded.append(pc)
+            if folded:
+                folded[-1].pop("_fold_forward", None)
+            proto = folded
+
         return proto
 
     def _generate_titles(
@@ -268,8 +315,19 @@ class TranscriptSegmenter:
     def _fallback_title(self, proto_chapter: Dict) -> str:
         return proto_chapter["type"].replace("_", " ").title()
 
+    def _segments_from_timing(self, timing: Optional[dict]) -> List[TranscriptSegment]:
+        """Build segments from Whisper's timestamps."""
+        out: List[TranscriptSegment] = []
+        for s in (timing or {}).get("segments") or []:
+            text = (s.get("text") or "").strip()
+            if not text:
+                continue
+            out.append(TranscriptSegment(text, float(s["start"]), float(s["end"]), len(out)))
+        return out
+
     def segment_transcript(
-        self, transcript: str, audio_file: str, return_cost: bool = False
+        self, transcript: str, audio_file: str, return_cost: bool = False,
+        timing: Optional[dict] = None,
     ) -> "List[Chapter] | Tuple[List[Chapter], ResponseInfo]":
         self.aggregated = AggregatedResponseInfo()
 
@@ -283,8 +341,12 @@ class TranscriptSegmenter:
         print(f"\n=== Segmenting Transcript ===")
         print(f"Duration: {duration:.1f}s")
 
-        sentences = self._split_into_sentences(transcript, duration)
-        print(f"Sentence segments: {len(sentences)}")
+        sentences = self._segments_from_timing(timing)
+        if sentences:
+            print(f"Timestamped segments (from Whisper): {len(sentences)}")
+        else:
+            sentences = self._split_into_sentences(transcript, duration)
+            print(f"Sentence segments: {len(sentences)}")
 
         groups = self._group_by_time(sentences) if sentences else []
         print(f"Time-window groups: {len(groups)}")
@@ -370,6 +432,7 @@ def segment_transcript(
     config: dict,
     use_llm: bool = True,
     return_cost: bool = False,
+    timing: dict = None,
 ) -> "List[Chapter] | Tuple[List[Chapter], ResponseInfo]":
     return TranscriptSegmenter(config, use_llm=use_llm).segment_transcript(
-        transcript, audio_file, return_cost=return_cost)
+        transcript, audio_file, return_cost=return_cost, timing=timing)

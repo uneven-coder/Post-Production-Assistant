@@ -87,6 +87,7 @@ class AppState:
     preview_path: Optional[str] = None
     total_cost: float = 0.0
     cost_lines: List[str] = field(default_factory=list)
+    cost_estimate: Optional[Dict] = None
     error: Optional[str] = None
 
     def reset_run(self):
@@ -96,6 +97,7 @@ class AppState:
         self.preview_path = None
         self.total_cost = 0.0
         self.cost_lines = []
+        self.cost_estimate = None
         self.error = None
         self.running = True
         for s in self.stages:
@@ -133,11 +135,21 @@ def _fmt_time(seconds):
 
 
 def _chapter_attr(ch, *keys):
+    # Chapters are either live `chapters.segmenter.Chapter` objects (this session's
+    # run) or plain dicts (loaded from a past run's manifest/chapters.json) - dicts
+    # have no __dict__ of their own, so this branches to read the right container.
     d = ch.__dict__ if hasattr(ch, "__dict__") else ch
     for k in keys:
         if k in d:
             return d[k]
     return None
+
+
+def _chapter_set(ch, key, value):
+    if isinstance(ch, dict):
+        ch[key] = value
+    else:
+        setattr(ch, key, value)
 
 
 _COST_RE = re.compile(r"\$\s*([\d.]+)")
@@ -214,8 +226,14 @@ class PAEApp(tk.Tk):
             self.state.config_path = path
             self._reload_config()
 
+    def _main_project(self) -> Dict:
+        return self.state.config.setdefault("project", {}).setdefault("main_profile", {})
+
+    def _main_project_ro(self) -> Dict:
+        return (self.state.config.get("project") or {}).get("main_profile") or {}
+
     def _current_silence_mode(self) -> str:
-        mode = (self.state.config.get("project") or {}).get("silence_removal", {}).get("mode", "off")
+        mode = self._main_project_ro().get("silence_removal", {}).get("mode", "off")
         return mode if mode in SILENCE_MODES else "off"
 
     def _sync_mode_selector(self):
@@ -223,7 +241,7 @@ class PAEApp(tk.Tk):
             self._mode_var.set(self._current_silence_mode())
 
     def _on_mode_change(self, _event=None):
-        proj = self.state.config.setdefault("project", {})
+        proj = self._main_project()
         proj.setdefault("silence_removal", {})["mode"] = self._mode_var.get()
         self._sync_config_from_state()
 
@@ -285,6 +303,12 @@ class PAEApp(tk.Tk):
             bg="#3c3c3c", fg="#d4d4d4", font=("Arial", 9, "bold"),
             padx=10, pady=3, relief="flat", cursor="hand2")
         self._youtube_btn.pack(side="left", padx=(2, 2))
+
+        self._open_run_btn = tk.Button(
+            bar, text="📂 Open Run", command=self._on_open_past_run_click,
+            bg="#3c3c3c", fg="#d4d4d4", font=("Arial", 9, "bold"),
+            padx=10, pady=3, relief="flat", cursor="hand2")
+        self._open_run_btn.pack(side="left", padx=(2, 2))
 
         self._stop_btn = tk.Button(
             bar, text="■  Stop", command=self._stop_run,
@@ -371,6 +395,15 @@ class PAEApp(tk.Tk):
                  fg="#9cdcfe", font=("Consolas", 8), wraplength=350,
                  justify="left", anchor="w").pack(fill="x")
 
+        cost_bar = tk.Frame(tab, bg="#252526", pady=6, padx=10)
+        cost_bar.pack(fill="x")
+        tk.Label(cost_bar, text="Estimated processing cost:", bg="#252526",
+                 fg="#888", font=("Arial", 8)).pack(anchor="w")
+        self._video_cost_var = tk.StringVar(value="-")
+        tk.Label(cost_bar, textvariable=self._video_cost_var, bg="#252526",
+                 fg="#4ec9b0", font=("Consolas", 9, "bold"),
+                 wraplength=350, justify="left", anchor="w").pack(fill="x")
+
         self._videos_tree.bind("<<TreeviewSelect>>", self._on_video_select)
         self._videos_tree.bind("<Double-1>", self._on_video_double_click)
         self._videos_tree.bind("<Button-3>", self._videos_context_menu)
@@ -381,7 +414,7 @@ class PAEApp(tk.Tk):
         for row in self._videos_tree.get_children():
             self._videos_tree.delete(row)
 
-        videos = (self.state.config.get("project") or {}).get("videos") or []
+        videos = self._main_project_ro().get("videos") or []
         for v in videos:
             pc = v.get("path") or {}
             path_dir = pc.get("path", pc.get("file", ""))
@@ -393,12 +426,34 @@ class PAEApp(tk.Tk):
                 self._videos_tree.tag_configure("missing", foreground="#f44336")
                 self._videos_tree.item(iid, tags=("missing",))
 
+        self._refresh_video_cost_estimate()
+
+    def _refresh_video_cost_estimate(self):
+        # pre-run estimate
+        # so it stays accurate even before the config's been run/resolved once.
+        if not hasattr(self, "_video_cost_var"):
+            return
+        try:
+            from config import apply_profile, resolve_paths
+            from main import estimate_pipeline_cost
+            from ai.pricing import format_estimate
+            import copy
+
+            config = resolve_paths(apply_profile(copy.deepcopy(self.state.config), "main"))
+            est = estimate_pipeline_cost(config)
+            if est:
+                self._video_cost_var.set(format_estimate(est))
+            else:
+                self._video_cost_var.set("- (no audio source video found)")
+        except Exception as e:
+            self._video_cost_var.set(f"- (estimate unavailable: {e})")
+
     def _on_video_select(self, _event=None):
         sel = self._videos_tree.selection()
         if not sel:
             return
         idx = self._videos_tree.index(sel[0])
-        videos = (self.state.config.get("project") or {}).get("videos") or []
+        videos = self._main_project_ro().get("videos") or []
         if 0 <= idx < len(videos):
             pc = videos[idx].get("path") or {}
             self._video_detail_var.set(pc.get("file") or pc.get("path") or "-")
@@ -408,7 +463,7 @@ class PAEApp(tk.Tk):
         if not sel:
             return
         idx = self._videos_tree.index(sel[0])
-        videos = (self.state.config.get("project") or {}).get("videos") or []
+        videos = self._main_project_ro().get("videos") or []
         if 0 <= idx < len(videos):
             self._open_video_edit_dialog(idx, videos[idx])
 
@@ -436,7 +491,7 @@ class PAEApp(tk.Tk):
     def _set_audio_source(self, idx):
         if idx is None:
             return
-        videos = (self.state.config.get("project") or {}).get("videos") or []
+        videos = self._main_project().get("videos") or []
         if not (0 <= idx < len(videos)):
             return
         for i, v in enumerate(videos):
@@ -453,7 +508,7 @@ class PAEApp(tk.Tk):
     def _toggle_tag(self, idx, tag):
         if idx is None:
             return
-        videos = (self.state.config.get("project") or {}).get("videos") or []
+        videos = self._main_project().get("videos") or []
         if not (0 <= idx < len(videos)):
             return
         tags = list(videos[idx].get("tags") or [])
@@ -508,7 +563,7 @@ class PAEApp(tk.Tk):
                        activebackground="#1e1e1e", selectcolor="#252526").pack(side="left")
 
         def save():
-            videos = (self.state.config.get("project") or {}).get("videos") or []
+            videos = self._main_project().get("videos") or []
             if not (0 <= idx < len(videos)):
                 dlg.destroy()
                 return
@@ -542,7 +597,7 @@ class PAEApp(tk.Tk):
         )
         if not path:
             return
-        proj = self.state.config.setdefault("project", {})
+        proj = self._main_project()
         videos = proj.setdefault("videos", [])
         videos.append({
             "path": {
@@ -560,7 +615,7 @@ class PAEApp(tk.Tk):
         if not sel:
             return
         idx = self._videos_tree.index(sel[0])
-        videos = (self.state.config.get("project") or {}).get("videos") or []
+        videos = self._main_project().get("videos") or []
         if 0 <= idx < len(videos):
             videos.pop(idx)
             self._sync_config_from_state()
@@ -577,7 +632,7 @@ class PAEApp(tk.Tk):
         if not path:
             return
         idx = self._videos_tree.index(sel[0])
-        videos = (self.state.config.get("project") or {}).get("videos") or []
+        videos = self._main_project().get("videos") or []
         if 0 <= idx < len(videos):
             videos[idx]["path"] = {
                 "path": os.path.dirname(path),
@@ -752,11 +807,11 @@ class PAEApp(tk.Tk):
         if idx is None or not self.state.chapters:
             return
         ch = self.state.chapters[idx]
-        current = getattr(ch, "title", f"Chapter {idx + 1}")
+        current = _chapter_attr(ch, "title") or f"Chapter {idx + 1}"
         new_title = simpledialog.askstring(
             "Rename Chapter", "New title:", initialvalue=current, parent=self)
         if new_title and new_title.strip():
-            ch.title = new_title.strip()
+            _chapter_set(ch, "title", new_title.strip())
             self._refresh_chapters_tree()
             self._redraw_timeline()
 
@@ -780,10 +835,18 @@ class PAEApp(tk.Tk):
             messagebox.showinfo("Merge", "No next chapter to merge with.", parent=self)
             return
         a, b = chapters[idx], chapters[idx + 1]
-        a.end_time = b.end_time
-        a.duration = a.end_time - a.start_time
-        a.segments = a.segments + b.segments
-        a.segment_types = a.segment_types + b.segment_types
+        end_time = _chapter_attr(b, "end_time", "end")
+        start_time = _chapter_attr(a, "start_time", "start") or 0
+        _chapter_set(a, "end_time", end_time)
+        _chapter_set(a, "duration", (end_time or 0) - start_time)
+        a_segs, b_segs = _chapter_attr(a, "segments"), _chapter_attr(b, "segments")
+        if a_segs is not None or b_segs is not None:
+            _chapter_set(a, "segments", (a_segs or []) + (b_segs or []))
+        _chapter_set(a, "segment_types",
+                    (_chapter_attr(a, "segment_types") or []) + (_chapter_attr(b, "segment_types") or []))
+        a_text, b_text = _chapter_attr(a, "text"), _chapter_attr(b, "text")
+        if a_text is not None or b_text is not None:
+            _chapter_set(a, "text", f"{a_text or ''} {b_text or ''}".strip())
         chapters.pop(idx + 1)
         self._refresh_chapters_tree()
         self._redraw_timeline()
@@ -982,6 +1045,149 @@ class PAEApp(tk.Tk):
         except Exception:
             return False
 
+    def _list_past_runs(self):
+        from main import find_past_runs, output_root_from_template
+        raw_template = self._main_project_ro().get(
+            "output_directory", "./output/{project_name}_{date}_{time}")
+        if not isinstance(raw_template, str):
+            raw_template = "./output/"
+        return find_past_runs(output_root_from_template(raw_template))
+
+    def _on_open_past_run_click(self):
+        if self.state.running:
+            messagebox.showinfo("Busy", "Wait for the current run to finish first.")
+            return
+
+        runs = self._list_past_runs()
+        if not runs:
+            messagebox.showinfo("No past runs",
+                                "No completed runs with a saved manifest were found "
+                                "in the output folder.")
+            return
+
+        from datetime import datetime
+        dlg = tk.Toplevel(self)
+        dlg.title("Open Past Run")
+        dlg.configure(bg="#1e1e1e")
+        dlg.geometry("520x360")
+        dlg.minsize(420, 260)
+
+        tk.Label(dlg, text="Load a previous run's results (silence cuts, chapters, "
+                           "summary) back into the app for review:",
+                 bg="#1e1e1e", fg="#888899", font=("Arial", 9), wraplength=500,
+                 justify="left").pack(fill="x", padx=10, pady=(10, 4))
+
+        btn_row = tk.Frame(dlg, bg="#1e1e1e")
+        btn_row.pack(side="bottom", pady=(4, 10))
+
+        lb = tk.Listbox(dlg, bg="#0d0d0d", fg="#d4d4d4", font=("Consolas", 9),
+                        selectmode="browse", relief="flat", borderwidth=0,
+                        selectbackground="#264f78", activestyle="none")
+        lb.pack(fill="both", expand=True, padx=10, pady=4)
+
+        for run in runs:
+            ts = run["saved_at"]
+            try:
+                ts = datetime.fromisoformat(run["saved_at"]).strftime("%Y-%m-%d %H:%M")
+            except (ValueError, TypeError):
+                pass
+            label = f"{ts} — {run['project_name']}"
+            if not run["video_ok"]:
+                label += "  (source video missing)"
+            lb.insert("end", label)
+        lb.selection_set(0)
+
+        def _open(_event=None):
+            sel = lb.curselection()
+            if not sel:
+                return
+            run = runs[sel[0]]
+            dlg.destroy()
+            self._load_past_run(run)
+
+        lb.bind("<Double-1>", _open)
+        tk.Button(btn_row, text="Open", command=_open, bg="#0e639c", fg="white",
+                  font=("Arial", 9, "bold"), padx=14, pady=3, relief="flat",
+                  cursor="hand2").pack(side="left", padx=4)
+        tk.Button(btn_row, text="Cancel", command=dlg.destroy, bg="#3c3c3c",
+                  fg="#d4d4d4", font=("Arial", 9), padx=10, pady=3, relief="flat",
+                  cursor="hand2").pack(side="left", padx=4)
+
+    def _load_past_run(self, run: Dict):
+        from main import load_run_manifest, format_run_summary
+        try:
+            config, silent_intervals = load_run_manifest(run["manifest_path"])
+        except Exception as e:
+            messagebox.showerror("Load failed", str(e))
+            return
+
+        self.state.last_resolved_config = config
+        self.state.silent_intervals = silent_intervals
+        self.state.error = None
+
+        self._append_log(f"--- Opened past run: {run['project_name']} "
+                         f"({run['saved_at']}) ---")
+        self._append_log(f"Output folder: {run['dir']}")
+
+        manifest = {}
+        try:
+            with open(run["manifest_path"], "r", encoding="utf-8") as f:
+                manifest = json.load(f)
+        except (OSError, json.JSONDecodeError) as e:
+            self._append_log(f"[warn] Could not read manifest: {e}")
+
+        # Chapters: the manifest is authoritative (newer runs embed them);
+        # chapters.json remains as a fallback for older runs.
+        chapters = manifest.get("chapters") or []
+        if not chapters:
+            chapters_path = os.path.join(run["dir"], "chapters.json")
+            if os.path.isfile(chapters_path):
+                try:
+                    with open(chapters_path, "r", encoding="utf-8") as f:
+                        chapters = json.load(f)
+                except (OSError, json.JSONDecodeError) as e:
+                    self._append_log(f"[warn] Could not read chapters.json: {e}")
+        if chapters:
+            self._set_chapters(chapters)
+        else:
+            self._clear_chapters()
+            self._redraw_timeline()
+
+        try:
+            # Run stats from the manifest when present, otherwise recomputed from whatever is avalible
+            summary = manifest.get("summary")
+            if not summary:
+                from main import build_run_summary
+                costs = manifest.get("costs") or {}
+                summary = build_run_summary(
+                    config, silent_intervals, chapters, manifest.get("cost_estimate"),
+                    stage_times=manifest.get("stage_times"),
+                    run_duration_s=manifest.get("run_duration_s"))
+                if costs.get("total_usd") is not None:
+                    summary["actual_cost_usd"] = costs["total_usd"]
+            else:
+                if "stage_times" not in summary and manifest.get("stage_times"):
+                    summary["stage_times"] = manifest["stage_times"]
+                if "run_duration_s" not in summary and manifest.get("run_duration_s") is not None:
+                    summary["run_duration_s"] = manifest["run_duration_s"]
+            for line in format_run_summary(summary):
+                self._append_log(line, tag="cost" if "$" in line else "success")
+        except Exception as e:
+            self._append_log(f"[warn] Could not build run summary: {e}")
+
+        costs = manifest.get("costs") or {}
+        for step in ("transcription", "chapters"):
+            info = costs.get(step) or {}
+            if info.get("total_cost") is not None:
+                self._append_log(
+                    f"  {step}: ${info['total_cost']:.4f}"
+                    + (f" ({info.get('model')})" if info.get("model") else "")
+                    + (f" in {info['generation_time']:.1f}s"
+                       if info.get("generation_time") else ""),
+                    tag="cost")
+
+        self._set_status(f"Loaded past run: {run['project_name']}")
+
     def _youtube_output_options(self):
         # "Latest" is pinned first and greyed out until a run happens this session;
         # everything else found on disk follows, newest first.
@@ -1005,7 +1211,7 @@ class PAEApp(tk.Tk):
                 "label": "Latest (this session) — no run yet",
             })
 
-        raw_template = (self.state.config.get("project") or {}).get(
+        raw_template = self._main_project_ro().get(
             "output_directory", "./output/{project_name}_{date}_{time}")
         if not isinstance(raw_template, str):
             raw_template = "./output/"
@@ -1225,7 +1431,7 @@ class PAEApp(tk.Tk):
             x1 = (st / total) * w
             x2 = (en / total) * w
 
-            seg_types = getattr(ch, "segment_types", []) or []
+            seg_types = _chapter_attr(ch, "segment_types") or []
             dom_type = seg_types[0].get("type", "default") if seg_types else "default"
             color = CHAPTER_COLORS.get(dom_type, CHAPTER_COLORS["default"])
 
@@ -1233,7 +1439,7 @@ class PAEApp(tk.Tk):
             c.create_rectangle(x1, self._CH_Y1, x2, self._CH_Y2,
                                 fill=color, outline="#1e1e1e", width=1,
                                 tags=(f"ch_{ci}",))
-            label = getattr(ch, "title", f"Chapter {ci+1}")
+            label = _chapter_attr(ch, "title") or f"Chapter {ci+1}"
             if x2 - x1 > 30:
                 c.create_text(
                     min(x1 + 6, (x1 + x2) / 2), (self._CH_Y1 + self._CH_Y2) / 2,
@@ -1320,7 +1526,7 @@ class PAEApp(tk.Tk):
             for x1, x2, ci in self._timeline_ch_segs:
                 if x1 <= x <= x2:
                     ch = self.state.chapters[ci]
-                    title = getattr(ch, "title", f"Chapter {ci+1}")
+                    title = _chapter_attr(ch, "title") or f"Chapter {ci+1}"
                     st = _chapter_attr(ch, "start_time", "start") or 0
                     en = _chapter_attr(ch, "end_time",   "end")   or 0
                     self._timeline_tooltip.config(
@@ -1376,12 +1582,14 @@ class PAEApp(tk.Tk):
         max_t = (_chapter_attr(chapters[i+1], "end_time", "end") or self._timeline_total) - 5
         new_time = max(min_t, min(max_t, new_time))
 
-        if hasattr(chapters[i], "end_time"):
-            chapters[i].end_time = new_time
-            chapters[i].duration = new_time - (chapters[i].start_time or 0)
-        if hasattr(chapters[i+1], "start_time"):
-            chapters[i+1].start_time = new_time
-            chapters[i+1].duration = (chapters[i+1].end_time or 0) - new_time
+        if _chapter_attr(chapters[i], "end_time", "end") is not None:
+            _chapter_set(chapters[i], "end_time", new_time)
+            start = _chapter_attr(chapters[i], "start_time", "start") or 0
+            _chapter_set(chapters[i], "duration", new_time - start)
+        if _chapter_attr(chapters[i+1], "start_time", "start") is not None:
+            _chapter_set(chapters[i+1], "start_time", new_time)
+            end = _chapter_attr(chapters[i+1], "end_time", "end") or 0
+            _chapter_set(chapters[i+1], "duration", end - new_time)
         self._redraw_timeline()
 
     def _timeline_drag_end(self, event):
@@ -1402,7 +1610,7 @@ class PAEApp(tk.Tk):
 
         if clicked_ci is not None:
             ch = self.state.chapters[clicked_ci]
-            ch_title = getattr(ch, 'title', f'Chapter {clicked_ci + 1}')
+            ch_title = _chapter_attr(ch, "title") or f"Chapter {clicked_ci + 1}"
             menu.add_command(
                 label=f"Rename \"{ch_title}\"…",
                 command=lambda: self._rename_chapter_by_index(clicked_ci))
@@ -1474,10 +1682,10 @@ class PAEApp(tk.Tk):
             messagebox.showerror("JSON Error", f"Invalid config:\n{e}")
             return
 
-        from config import resolve_paths
+        from config import apply_profile, resolve_paths
         from main import _assign_asset_ids
         import copy
-        config = resolve_paths(copy.deepcopy(self.state.config))
+        config = resolve_paths(apply_profile(copy.deepcopy(self.state.config), "main"))
         _assign_asset_ids(config)
         self._run_config(config)
 
@@ -1492,14 +1700,14 @@ class PAEApp(tk.Tk):
             messagebox.showerror("JSON Error", f"Invalid config:\n{e}")
             return
 
-        if not (base_config.get("project") or {}).get("silence_only_profile"):
+        from config import apply_profile, has_profile, resolve_paths
+        if not has_profile(base_config, "silence_only"):
             messagebox.showerror(
                 "Missing profile",
                 "This config has no project.silence_only_profile block to run.\n\n"
                 "Add one (see README), or use Browse… to load a config that does.")
             return
 
-        from config import apply_profile, resolve_paths
         from main import _assign_asset_ids
         derived = apply_profile(base_config, "silence_only")
         derived.setdefault("project", {}).setdefault("silence_removal", {})["mode"] = "only"
@@ -1589,6 +1797,11 @@ class PAEApp(tk.Tk):
         elif kind == MSG_SILENCE:
             self.state.silent_intervals = data or []
             self._redraw_timeline()
+
+        elif kind == MSG_COST:
+            est = (data or {}).get("estimate") if isinstance(data, dict) else None
+            if est:
+                self.state.cost_estimate = est
 
         elif kind == MSG_BORDERS:
             self.state.border_images = data or []
@@ -1696,11 +1909,11 @@ class PAEApp(tk.Tk):
 
         chapters = self.state.chapters
         for ci, ch in enumerate(chapters):
-            title    = getattr(ch, "title", f"Chapter {ci + 1}")
+            title    = _chapter_attr(ch, "title") or f"Chapter {ci + 1}"
             start    = _chapter_attr(ch, "start_time", "start") or 0
             end      = _chapter_attr(ch, "end_time",   "end")   or 0
             duration = end - start if end > start else 0
-            seg_types = getattr(ch, "segment_types", []) or []
+            seg_types = _chapter_attr(ch, "segment_types") or []
             dom_type = seg_types[0].get("type", "") if seg_types else ""
 
             ch_iid = self._chapters_tree.insert(
